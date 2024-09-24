@@ -34,9 +34,9 @@ DeviceSettings::DeviceSettings() {
     midiUsb = midiSettings();
     midi2 = midiSettings();
     dirty = true;
-    wifiSsid = "TestWifi";
-    wifiPassword = "TestTestTest";
-    wifiEnabled = true;
+    wifiSsid = "";
+    wifiPassword = "";
+    wifiEnabled = false;
     midi_sysex_id = 0x00;
     idleTimeout = 10000;
 };
