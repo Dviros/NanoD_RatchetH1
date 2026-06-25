@@ -52,6 +52,8 @@ public:
     static constexpr uint8_t  MAX_TCP_CLIENTS = 4;
     // Max inbound line length (bytes); longer lines are dropped
     static constexpr size_t   MAX_LINE_BYTES  = 2048;
+    // Handshake must complete within this window or the connection is closed
+    static constexpr uint32_t AUTH_TIMEOUT_MS = 5000;
 
 private:
     // Internal task bookkeeping
@@ -65,10 +67,37 @@ private:
     void _setupOTA();
     void _setupTcpServer();
 
-    // Per-client state: accumulated partial line
+    // Per-client state: accumulated partial line + HMAC-SHA256 auth state machine.
+    //
+    // Auth flow (per connection):
+    //   1. New accept: if PSK is empty → fail-closed (send error, close).
+    //      Else: generate device_nonce, send {"hello":{"nonce":"<hex>","proto":1}},
+    //            set state = WAIT_CLIENT_AUTH, record auth_deadline.
+    //   2. While WAIT_CLIENT_AUTH: only {"auth":{"hmac":"<hex>","nonce":"<clientHex>"}}
+    //      is accepted.  Anything else is silently dropped (no forwarding to com_thread).
+    //      Verify hmac == HMAC-SHA256(psk, device_nonce_bytes).
+    //      On match: send {"auth":{"ok":true,"hmac":"<deviceProofHex>"}} (device proof
+    //                = HMAC-SHA256(psk, client_nonce_bytes)), set state = AUTHED.
+    //      On mismatch or timeout: send {"auth":{"ok":false}}, close socket.
+    //   3. AUTHED: normal forwarding to com_thread; out-queue frames broadcast only to
+    //              AUTHED slots (no bytes leak to unauthenticated sockets).
+    //
+    // Nonces are single-use per-connection; slot reset on disconnect clears them.
     struct ClientSlot {
+        enum class AuthState : uint8_t {
+            WAIT_HELLO_SENT,   // device has not sent hello yet (transient, same loop tick)
+            WAIT_CLIENT_AUTH,  // hello sent, waiting for client auth message
+            AUTHED             // handshake complete; normal data flow active
+        };
+
         WiFiClient client;
-        String     buf;   // partial line accumulator
+        String     buf;           // partial line accumulator
+
+        // Auth state machine fields
+        AuthState  authState     = AuthState::WAIT_HELLO_SENT;
+        uint8_t    deviceNonce[16];  // raw bytes of the device nonce (sent as hex)
+        String     deviceNonceHex;   // cached hex string sent to client
+        unsigned long authDeadline = 0; // millis() deadline for handshake (0 = not started)
     };
 
     ClientSlot _slots[MAX_TCP_CLIENTS];

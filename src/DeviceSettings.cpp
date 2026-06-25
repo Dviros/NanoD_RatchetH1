@@ -146,6 +146,7 @@ void DeviceSettings::_applyDefaults() {
     wifiEnabled       = false;
     pdVoltage         = 5.0f;
     activeSprite      = "";
+    netPsk            = "";
     dirty             = true;
 }
 
@@ -194,6 +195,19 @@ void DeviceSettings::setWifiEnabled(bool v) {
 }
 
 // -----------------------------------------------------------------------
+// Network PSK accessors — stored in NVS alongside WiFi creds.
+// getNetPsk() returns plaintext for internal auth use ONLY.
+// setNetPsk() is only called from operator= (USB serial settings path).
+// The plaintext value is NEVER emitted over any transport (see toJSON).
+// -----------------------------------------------------------------------
+String DeviceSettings::getNetPsk() {
+    take(); String v = netPsk; give(); return v;
+}
+void DeviceSettings::setNetPsk(const String& v) {
+    take(); netPsk = v; _saveWifiToNvs(); give();
+}
+
+// -----------------------------------------------------------------------
 // PD voltage accessor — clamped to board-safe [5.0, 9.0] V
 // -----------------------------------------------------------------------
 float DeviceSettings::getPdVoltage() {
@@ -224,6 +238,8 @@ void DeviceSettings::_loadWifiFromNvs() {
     wifiSsid     = wifi_preferences.getString("ssid",     "");
     wifiPassword = wifi_preferences.getString("password", "");
     wifiEnabled  = wifi_preferences.getBool  ("enabled",  false);
+    // Network PSK — stored in same NVS namespace; never appears in JSON
+    netPsk       = wifi_preferences.getString("netPsk",   "");
     xSemaphoreGiveRecursive(_nvsMutex);
 }
 
@@ -232,6 +248,8 @@ void DeviceSettings::_saveWifiToNvs() {
     wifi_preferences.putString("ssid",     wifiSsid);
     wifi_preferences.putString("password", wifiPassword);
     wifi_preferences.putBool  ("enabled",  wifiEnabled);
+    // Network PSK — stored alongside WiFi creds, never serialised to JSON
+    wifi_preferences.putString("netPsk",   netPsk);
     xSemaphoreGiveRecursive(_nvsMutex);
 }
 
@@ -255,7 +273,10 @@ DeviceSettings& DeviceSettings::operator=(JsonObject& obj) {
     if (obj["idleTimeout"].is<uint32_t>())
         idleTimeout = obj["idleTimeout"].as<uint32_t>();
 
-    // WiFi — update in-memory AND persist to NVS
+    // WiFi + netPsk — update in-memory AND persist to NVS.
+    // netPsk is accepted ONLY from the USB serial settings path (this function).
+    // It is NEVER accepted over the TCP transport (the TCP path is authenticated
+    // USING the PSK, so changing it mid-session would be a logic loop).
     bool wifiChanged = false;
     if (!obj["wifiSsid"].isNull()) {
         wifiSsid = obj["wifiSsid"].as<String>();
@@ -267,6 +288,11 @@ DeviceSettings& DeviceSettings::operator=(JsonObject& obj) {
     }
     if (!obj["wifiEnabled"].isNull()) {
         wifiEnabled = obj["wifiEnabled"].as<bool>();
+        wifiChanged = true;
+    }
+    if (!obj["netPsk"].isNull()) {
+        // Accept any non-null value; an empty string clears the PSK (disables net auth)
+        netPsk = obj["netPsk"].as<String>();
         wifiChanged = true;
     }
     if (wifiChanged) _saveWifiToNvs();
@@ -327,7 +353,10 @@ void DeviceSettings::toJSON(JsonObject& obj, bool redactWifi) {
     obj["wifiEnabled"]       = wifiEnabled;
     if (wifiSsid.length() > 0)
         obj["wifiSsid"] = wifiSsid;
-    // Password is always redacted in serial output; wifi_thread reads NVS directly
+    // Password and netPsk are always redacted; wifi_thread reads NVS directly.
+    // netPsk is NEVER emitted in plaintext over ANY transport — not even with
+    // redactWifi=false — because there is no legitimate consumer of the plaintext
+    // outside of the device itself (auth code uses getNetPsk()).
     if (redactWifi) {
         if (wifiPassword.length() > 0)
             obj["wifiPassword"] = "***";
@@ -335,6 +364,10 @@ void DeviceSettings::toJSON(JsonObject& obj, bool redactWifi) {
         if (wifiPassword.length() > 0)
             obj["wifiPassword"] = wifiPassword;
     }
+    // netPsk: always "***" when set, omitted when empty — same policy for both
+    // redactWifi modes; the plaintext must never leave the device.
+    if (netPsk.length() > 0)
+        obj["netPsk"] = "***";
 
     JsonObject midiUsbObj = obj["midiUsb"].to<JsonObject>();
     midiUsbObj["in"]    = midiUsb.in;

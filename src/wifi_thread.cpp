@@ -7,6 +7,7 @@
 
 #include "DeviceSettings.h"
 #include "com_thread.h"   // net_submit() + net_attach_out()
+#include "net_auth.h"     // hmac_sha256, hex_encode/decode, ct_memeq, make_nonce_hex
 
 #include <WiFi.h>         // WiFiGeneric/WiFiEvent types (arduino-esp32 2.x)
 #include <WiFiServer.h>
@@ -114,19 +115,45 @@ void WifiThread::loop() {
             bool placed = false;
             for (auto& slot : _slots) {
                 if (!slot.client.connected()) {
-                    slot.client = incoming;
-                    slot.buf    = "";
+                    slot.client    = incoming;
+                    slot.buf       = "";
+                    slot.authState = ClientSlot::AuthState::WAIT_HELLO_SENT;
+                    slot.deviceNonceHex = "";
+                    memset(slot.deviceNonce, 0, sizeof(slot.deviceNonce));
+                    slot.authDeadline = 0;
+                    placed = true;
+
                     Serial.printf("[WIFI] TCP client connected from %s\n",
                                   incoming.remoteIP().toString().c_str());
-                    // Greet with device info
-                    String hello = "{\"connected\":true,\"ip\":\"" + ip() +
-                                   "\",\"device\":\"" +
-                                   DeviceSettings::getInstance().deviceName +
-                                   "\",\"fw\":\"" +
-                                   DeviceSettings::getInstance().firmwareVersion +
-                                   "\"}";
-                    slot.client.println(hello);
-                    placed = true;
+
+                    // ── Auth gate: fail-closed if no PSK is configured ──────
+                    String psk = DeviceSettings::getInstance().getNetPsk();
+                    if (psk.length() == 0) {
+                        // No PSK configured — refuse immediately.
+                        // One-time warning (use a static flag to avoid spamming).
+                        static bool s_noPskWarned = false;
+                        if (!s_noPskWarned) {
+                            Serial.println("[WIFI] AUTH: net PSK not configured — "
+                                           "all TCP connections refused. "
+                                           "Set via USB: {\"settings\":{\"netPsk\":\"<key>\"}}");
+                            s_noPskWarned = true;
+                        }
+                        slot.client.println("{\"error\":\"net auth not configured\"}");
+                        slot.client.stop();
+                        // Leave slot.client disconnected; the slot is free again.
+                        break;
+                    }
+
+                    // ── Send hello with device nonce ────────────────────────
+                    slot.deviceNonceHex = make_nonce_hex(slot.deviceNonce);
+                    // {"hello":{"nonce":"<32hex>","proto":1}}
+                    String helloMsg = "{\"hello\":{\"nonce\":\"" +
+                                       slot.deviceNonceHex +
+                                       "\",\"proto\":1}}";
+                    slot.client.println(helloMsg);
+
+                    slot.authState    = ClientSlot::AuthState::WAIT_CLIENT_AUTH;
+                    slot.authDeadline = millis() + AUTH_TIMEOUT_MS;
                     break;
                 }
             }
@@ -137,40 +164,165 @@ void WifiThread::loop() {
         }
     }
 
+    // ── Handshake timeout enforcement ──────────────────────────────────────
+    // Check before reading so a stalled client is evicted even if it sends
+    // nothing (denial-of-service / slot exhaustion guard).
+    {
+        unsigned long now = millis();
+        for (auto& slot : _slots) {
+            if (!slot.client.connected()) continue;
+            if (slot.authState == ClientSlot::AuthState::WAIT_CLIENT_AUTH &&
+                slot.authDeadline != 0 && now > slot.authDeadline)
+            {
+                Serial.println("[WIFI] AUTH: handshake timeout — closing connection");
+                slot.client.println("{\"auth\":{\"ok\":false}}");
+                slot.client.stop();
+                // slot fields reset on next accept
+            }
+        }
+    }
+
     // ── Read inbound data from connected clients ────────────────────────────
     for (auto& slot : _slots) {
         if (!slot.client.connected()) continue;
+
         while (slot.client.available()) {
             char c = static_cast<char>(slot.client.read());
             if (c == '\n' || c == '\r') {
-                if (slot.buf.length() > 0) {
-                    if (slot.buf.length() <= MAX_LINE_BYTES) {
-                        // Forward to com_thread for parsing (queue-based, no cross-task parse)
-                        com_thread.net_submit(new String(slot.buf));
-                    } else {
-                        Serial.printf("[WIFI] TCP: line too long (%u bytes), dropped\n",
-                                      (unsigned)slot.buf.length());
-                    }
+                if (slot.buf.length() == 0) continue;
+
+                // ── Line too long: drop regardless of auth state ──────────
+                if (slot.buf.length() > MAX_LINE_BYTES) {
+                    Serial.printf("[WIFI] TCP: line too long (%u bytes), dropped\n",
+                                  (unsigned)slot.buf.length());
                     slot.buf = "";
+                    continue;
+                }
+
+                String line = slot.buf;
+                slot.buf = "";
+
+                if (slot.authState == ClientSlot::AuthState::AUTHED) {
+                    // Normal path — forward to com_thread
+                    com_thread.net_submit(new String(line));
+
+                } else if (slot.authState == ClientSlot::AuthState::WAIT_CLIENT_AUTH) {
+                    // ── Auth message expected: {"auth":{"hmac":"<hex>","nonce":"<hex>"}} ──
+                    // Parse with ArduinoJson (stack-allocated, small doc).
+                    // We only accept the "auth" key; anything else is silently dropped
+                    // (no data forwarded, no response — starve unknown frames).
+                    JsonDocument authDoc;
+                    DeserializationError err = deserializeJson(authDoc, line);
+                    if (err || !authDoc["auth"].is<JsonObject>()) {
+                        // Not a valid auth frame — drop silently, keep waiting
+                        Serial.println("[WIFI] AUTH: non-auth frame dropped (not authed)");
+                        continue;
+                    }
+
+                    JsonObject authObj  = authDoc["auth"].as<JsonObject>();
+                    const char* hmacHex  = authObj["hmac"]  | "";
+                    const char* cnHex    = authObj["nonce"]  | "";
+
+                    // Both fields must be present
+                    if (strlen(hmacHex) == 0 || strlen(cnHex) == 0) {
+                        Serial.println("[WIFI] AUTH: malformed auth frame — closing");
+                        slot.client.println("{\"auth\":{\"ok\":false}}");
+                        slot.client.stop();
+                        continue;
+                    }
+
+                    // Decode client-provided HMAC (must be exactly 32 bytes = 64 hex chars)
+                    uint8_t clientHmac[32];
+                    if (!hex_decode(String(hmacHex), clientHmac, 32)) {
+                        Serial.println("[WIFI] AUTH: bad hmac hex — closing");
+                        slot.client.println("{\"auth\":{\"ok\":false}}");
+                        slot.client.stop();
+                        continue;
+                    }
+
+                    // Compute expected HMAC: HMAC-SHA256(psk, device_nonce_bytes)
+                    String psk = DeviceSettings::getInstance().getNetPsk();
+                    uint8_t expected[32];
+                    int rc = hmac_sha256(
+                        reinterpret_cast<const uint8_t*>(psk.c_str()), psk.length(),
+                        slot.deviceNonce, sizeof(slot.deviceNonce),
+                        expected);
+                    if (rc != 0) {
+                        Serial.printf("[WIFI] AUTH: HMAC computation failed (%d) — closing\n", rc);
+                        slot.client.println("{\"auth\":{\"ok\":false}}");
+                        slot.client.stop();
+                        continue;
+                    }
+
+                    // Constant-time compare to avoid timing oracle on the HMAC value
+                    if (!ct_memeq(clientHmac, expected, 32)) {
+                        Serial.println("[WIFI] AUTH: HMAC mismatch — closing");
+                        slot.client.println("{\"auth\":{\"ok\":false}}");
+                        slot.client.stop();
+                        continue;
+                    }
+
+                    // ── HMAC verified: compute device proof and send ────────
+                    // Device proof = HMAC-SHA256(psk, client_nonce_bytes)
+                    // This proves the device holds the same PSK → mutual auth.
+                    uint8_t clientNonce[16];
+                    if (!hex_decode(String(cnHex), clientNonce, 16)) {
+                        // Client nonce hex must be exactly 32 chars (16 bytes).
+                        // If not, the handshake is malformed; close to be safe.
+                        Serial.println("[WIFI] AUTH: bad client nonce hex — closing");
+                        slot.client.println("{\"auth\":{\"ok\":false}}");
+                        slot.client.stop();
+                        continue;
+                    }
+
+                    uint8_t deviceProof[32];
+                    rc = hmac_sha256(
+                        reinterpret_cast<const uint8_t*>(psk.c_str()), psk.length(),
+                        clientNonce, sizeof(clientNonce),
+                        deviceProof);
+                    if (rc != 0) {
+                        Serial.printf("[WIFI] AUTH: device proof HMAC failed (%d) — closing\n", rc);
+                        slot.client.println("{\"auth\":{\"ok\":false}}");
+                        slot.client.stop();
+                        continue;
+                    }
+
+                    String proofHex = hex_encode(deviceProof, sizeof(deviceProof));
+                    String authOk = "{\"auth\":{\"ok\":true,\"hmac\":\"" + proofHex + "\"}}";
+                    slot.client.println(authOk);
+
+                    slot.authState = ClientSlot::AuthState::AUTHED;
+                    slot.authDeadline = 0; // disarm timeout
+                    Serial.printf("[WIFI] AUTH: client authenticated from %s\n",
+                                  slot.client.remoteIP().toString().c_str());
+
+                } else {
+                    // WAIT_HELLO_SENT — should not have data before hello is sent;
+                    // this is a transient state resolved within the same loop tick.
+                    // Drop silently.
                 }
             } else {
                 if (slot.buf.length() < MAX_LINE_BYTES) {
                     slot.buf += c;
                 } else {
                     // Already overlong — keep consuming until newline to re-sync
-                    slot.buf += c; // allow length to exceed so we drop on newline
+                    slot.buf += c;
                 }
             }
         }
     }
 
-    // ── Drain outbound queue → connected clients ────────────────────────────
+    // ── Drain outbound queue → AUTHED clients only ─────────────────────────
     // com_thread.emit() enqueues String* here; we own the pointer after dequeue.
+    // SECURITY: frames are broadcast ONLY to slots in the AUTHED state.
+    // Unauthenticated sockets receive ZERO bytes from the out-queue.
     if (_q_net_out != nullptr) {
         String* frame = nullptr;
         while (xQueueReceive(_q_net_out, &frame, 0) == pdTRUE && frame != nullptr) {
             for (auto& slot : _slots) {
-                if (slot.client.connected()) {
+                if (slot.client.connected() &&
+                    slot.authState == ClientSlot::AuthState::AUTHED)
+                {
                     slot.client.print(*frame);
                     if (!frame->endsWith("\n")) slot.client.print('\n');
                 }

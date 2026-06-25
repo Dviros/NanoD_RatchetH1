@@ -299,6 +299,32 @@ void ComThread::processCommand(JsonDocument& doc, ComThread& self) {
         self.sendAck("sprite", ok, ok ? nullptr : spriteErr.c_str());
       }
     }
+
+    // PD power status query — {"pd":"?"} or {"pd":"status"}
+    // Reply: {"pd":{"voltage":<V>,"current":<A>,"power":<W>,"source":"5V"|"PD"}}
+    // voltage = last negotiated/clamped value from DeviceSettings.pdVoltage
+    // current = value read from STUSB4500 for the active PDO during init_pd()
+    // power   = voltage * current (W)
+    // source  = "PD" when voltage > 5.0 V, else "5V"
+    v = doc["pd"];
+    if (v.is<String>()) {
+      String pdCmd = v.as<String>();
+      if (pdCmd == "?" || pdCmd == "status") {
+        float voltage = DeviceSettings::getInstance().getPdVoltage();
+        float current = hmi_thread.getPdCurrent();
+        float power   = voltage * current;
+        const char* source = (voltage > 5.05f) ? "PD" : "5V";
+        JsonDocument pdDoc;
+        JsonObject pdObj = pdDoc["pd"].to<JsonObject>();
+        pdObj["voltage"] = voltage;
+        pdObj["current"] = current;
+        pdObj["power"]   = power;
+        pdObj["source"]  = source;
+        String frame;
+        serializeJson(pdDoc, frame);
+        self.emit(frame);
+      }
+    }
 }
 
 

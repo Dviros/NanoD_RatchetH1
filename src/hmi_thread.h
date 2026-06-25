@@ -49,6 +49,11 @@ class HmiThread : public Thread<HmiThread> {
         void put_hmi_config(hmiConfig& new_config);
         void put_settings(HmiDeviceSettings& new_settings);
 
+        // PD status — set by init_pd(), read by com_thread for {"pd":"?"} query
+        // Returns the current (A) that was configured for the negotiated PDO.
+        // Returns 0 before init_pd() completes.
+        float getPdCurrent() const { return _pd_negotiated_current; }
+
         // Light Effects
         void halvesPointer(int indicator, int startpos, int endpos, int orientation, const struct CRGB& pointerCol, const struct CRGB& preCol, const struct CRGB& postCol);
         void IdleLeds(int fps, const struct CRGB& idleColStart, const struct CRGB& idleColMid, const struct CRGB& idleColEnd);
@@ -115,6 +120,9 @@ class HmiThread : public Thread<HmiThread> {
         // Mutex protecting haptic_state and other cross-thread HMI state.
         // Created in run() before any other thread can touch shared fields.
         SemaphoreHandle_t _hmi_mutex = nullptr;
+
+        // Set by init_pd() — current (A) for the negotiated PDO; 0 until negotiation completes.
+        float _pd_negotiated_current = 0.0f;
 
 };
 

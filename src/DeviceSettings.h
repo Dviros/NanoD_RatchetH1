@@ -108,6 +108,16 @@ public:
     void   setWifiEnabled(bool v);
 
     // -----------------------------------------------------------------------
+    // Network PSK — pre-shared key for TCP mutual auth handshake.
+    // Stored in NVS alongside WiFi creds.  NEVER emitted over any transport
+    // (redacted as "***" in toJSON()).  Set ONLY via the USB serial settings
+    // command: {"settings":{"netPsk":"<key>"}}.
+    // getNetPsk() returns plaintext for internal auth use only.
+    // -----------------------------------------------------------------------
+    String getNetPsk();
+    void   setNetPsk(const String& v);
+
+    // -----------------------------------------------------------------------
     // PD voltage accessor (clamped to [5.0, 9.0] V, board-safe)
     // -----------------------------------------------------------------------
     float  getPdVoltage();
@@ -152,6 +162,9 @@ public:
     bool wifiEnabled;
     float pdVoltage;      // [5.0, 9.0] V
     String activeSprite;
+
+    // Network PSK — internal only; never serialise plaintext; use getNetPsk()
+    String netPsk;
 
     // read-only device identity
     String serialNumber;

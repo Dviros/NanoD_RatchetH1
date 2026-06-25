@@ -546,26 +546,32 @@ PowerType HmiThread::init_pd() {
     if (!usb_pd.begin()) {
         Serial.println("STUSB4500 not found; defaulting to 5V USB");
         DeviceSettings::getInstance().setPdVoltage(5.0f); // thread-safe setter from FW5
+        _pd_negotiated_current = 0.9f;  // USB 2.0 default 900 mA
         return POWER_5V_USB;
     }
     Serial.println("STUSB4500 found");
 
-    // Fix 2b: only write NVM when the profile is not already correct, avoiding unnecessary flash wear.
-    if (usb_pd.getPdoNumber() != 2) {
+    // Only write NVM when the profile is not already correct, avoiding unnecessary flash wear.
+    // Guard checks PDO count AND the key PDO2 parameters so a previously-programmed NVM
+    // with wrong voltage-limit percentages is detected and reprogrammed.
+    bool needsProgram = (usb_pd.getPdoNumber() != 2)
+                     || (usb_pd.getVoltage(2) != 9.0f)
+                     || (usb_pd.getCurrent(2) != 3.0f)
+                     || (usb_pd.getVoltage(1) != 5.0f);
+    if (needsProgram) {
         Serial.println("Programming STUSB4500 NVM with USB-PD profiles");
         usb_pd.setUsbCommCapable(true);
+        // PDO1 — 5 V fallback (always present per USB-PD spec)
         usb_pd.setVoltage(1, 5.0);
         usb_pd.setCurrent(1, 3.0);
         usb_pd.setLowerVoltageLimit(1, 20);
         usb_pd.setUpperVoltageLimit(1, 20);
+        // PDO2 — 9 V high-power profile (board maximum, clamped externally)
         usb_pd.setVoltage(2, 9.0);
         usb_pd.setCurrent(2, 3.0);
         usb_pd.setLowerVoltageLimit(2, 20);
-        usb_pd.setUpperVoltageLimit(2, 10);
-        usb_pd.setVoltage(3, 9.0);
-        usb_pd.setCurrent(3, 3.0);
-        usb_pd.setLowerVoltageLimit(3, 20);
-        usb_pd.setUpperVoltageLimit(3, 10);
+        usb_pd.setUpperVoltageLimit(2, 20);  // 20 % tolerance — standard for STUSB4500
+        // Only two PDOs active; PDO3 slot is left at NVM default (unused).
         usb_pd.setPdoNumber(2);
         usb_pd.write();
 
@@ -605,17 +611,23 @@ PowerType HmiThread::init_pd() {
     }
 
     float negotiated_v = usb_pd.getVoltage(selected_pdo);
+    float negotiated_i = usb_pd.getCurrent(selected_pdo);
 
-    // Fix 2d (cont): clamp to board-safe [5.0, 9.0] V regardless of what the charger offered.
+    // Clamp to board-safe [5.0, 9.0] V regardless of what the charger offered.
     if (negotiated_v < 5.0f || negotiated_v > 9.0f) {
         Serial.printf("PD voltage %.1fV out of range, clamping to 5.0V\n", negotiated_v);
         negotiated_v = 5.0f;
+        negotiated_i = 0.9f; // USB default 900 mA when no PD contract
+    }
+    if (negotiated_i <= 0.0f) {
+        negotiated_i = 0.9f; // guard: library returns 0 for PDO1 on some NVM states
     }
 
-    // Store into DeviceSettings so foc_thread can consume it before motor init.
-    // Use thread-safe accessor provided by FW5.
+    // Store into DeviceSettings so foc_thread can consume voltage before motor init.
     DeviceSettings::getInstance().setPdVoltage(negotiated_v);
-    Serial.printf("PD negotiated: PDO%d = %.1fV\n", selected_pdo, negotiated_v);
+    // Store current so com_thread can serve {"pd":"?"} queries.
+    _pd_negotiated_current = negotiated_i;
+    Serial.printf("PD negotiated: PDO%d = %.1fV / %.2fA\n", selected_pdo, negotiated_v, negotiated_i);
 
     if (negotiated_v >= 9.0f) return POWER_9V_PD;
     if (negotiated_v > 5.0f)  return POWER_5V_PD; // 6/7/8V variants possible
