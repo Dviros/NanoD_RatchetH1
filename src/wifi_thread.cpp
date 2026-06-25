@@ -389,6 +389,11 @@ void WifiThread::_connect() {
     DeviceSettings& ds = DeviceSettings::getInstance();
     Serial.printf("[WIFI] Connecting to '%s' ...\n", ds.wifiSsid.c_str());
     WiFi.mode(WIFI_STA);
+    // Disable WiFi modem-sleep (power save). Default WIFI_PS_MIN_MODEM adds
+    // ~100-300ms variable latency to inbound packets (radio sleeps between DTIM
+    // beacons) — the real cause of the laggy polling, not Nagle. Costs a little
+    // power but makes the JSON API responsive (<20ms round-trips).
+    WiFi.setSleep(false);
     WiFi.begin(ds.wifiSsid.c_str(), ds.wifiPassword.c_str());
     WiFi.setAutoReconnect(true);
     // Non-blocking — result polled in loop() via WL_CONNECTED check.
