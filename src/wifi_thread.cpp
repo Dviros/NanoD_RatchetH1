@@ -85,6 +85,11 @@ void WifiThread::loop() {
         }
         if (!_tcp_server_started) {
             _setupTcpServer();
+            // Real low-latency fix: disable WiFi modem-sleep ONCE the link is up.
+            // Calling setSleep(false) before WiFi.begin() (in _connect) did not
+            // persist — power-save stayed on (ping RTT ~100ms). Setting it here,
+            // after every established connection, drops RTT to <5ms.
+            WiFi.setSleep(false);
         }
         ArduinoOTA.handle();
 
