@@ -1,57 +1,28 @@
 
-// FW6 — WifiThread
+// FW6 — WifiThread (lean raw-TCP transport; replaces ESPAsyncWebServer/AsyncTCP)
 // Only compiled when WIFI_ENABLED is defined in platformio.ini build_flags.
 #include "wifi_thread.h"   // declares WifiThread (real class or no-op stub) for BOTH branches
 
 #ifdef WIFI_ENABLED
 
 #include "DeviceSettings.h"
-#include "com_thread.h"   // for forwarding WS commands to serial path (via queue)
+#include "com_thread.h"   // net_submit() + net_attach_out()
 
-#include <WiFi.h>   // pulls in WiFiGeneric/WiFiEvent types (no standalone WiFiEvent.h in arduino-esp32 2.x)
+#include <WiFi.h>         // WiFiGeneric/WiFiEvent types (arduino-esp32 2.x)
+#include <WiFiServer.h>
+#include <WiFiClient.h>
 #include <ArduinoOTA.h>
-#include <ESPAsyncWebServer.h>  // me-no-dev/ESPAsyncWebServer
-#include <AsyncTCP.h>           // me-no-dev/AsyncTCP (pulled in transitively)
 #include <esp_ota_ops.h>
 #include <esp_task_wdt.h>
-#include <LittleFS.h>           // sprite_store uses LittleFS; wifi thread opens it lazily
+#include <freertos/queue.h>
 
 // ─── global singleton ────────────────────────────────────────────────────────
 WifiThread wifi_thread;
-
-// ─── module-private helpers ──────────────────────────────────────────────────
-namespace {
-
-// AsyncWebServer on port 80; AsyncWebSocket at /ws
-AsyncWebServer  g_server(80);
-AsyncWebSocket  g_ws("/ws");
 
 // OTA password (pulled from build flag; override in platformio.ini if desired)
 #ifndef WIFI_OTA_PASSWORD
 #  define WIFI_OTA_PASSWORD "nanod-ota"
 #endif
-
-// Minimal provisioning page served by SoftAP
-static const char PROV_PAGE[] PROGMEM = R"rawliteral(
-<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width'>
-<title>NanoD Setup</title></head><body>
-<h2>NanoD WiFi Setup</h2>
-<form method='POST' action='/prov'>
-  SSID: <input name='ssid' required><br>
-  Password: <input name='pw' type='password'><br>
-  <input type='submit' value='Connect'>
-</form></body></html>
-)rawliteral";
-
-// Convenience: serialize and emit a JSON document to all WebSocket clients
-void ws_send_json(JsonDocument& doc) {
-    String out;
-    serializeJson(doc, out);
-    g_ws.textAll(out);
-}
-
-} // anonymous namespace
-
 
 // ─── FreeRTOS task entry ─────────────────────────────────────────────────────
 
@@ -71,6 +42,11 @@ void ws_send_json(JsonDocument& doc) {
 
 void WifiThread::begin() {
     // Must be called from setup() after DeviceSettings::init() + fromSPIFFS().
+
+    // FW6: create outbound queue (String* pointers, depth 16) and register with com_thread.
+    _q_net_out = xQueueCreate(16, sizeof(String*));
+    com_thread.net_attach_out(_q_net_out);
+
     DeviceSettings& ds = DeviceSettings::getInstance();
 
     if (ds.wifiEnabled && ds.wifiSsid.length() > 0) {
@@ -87,7 +63,7 @@ void WifiThread::begin() {
     xTaskCreatePinnedToCore(
         WifiThread::taskEntry,
         "WIFI",
-        8192,       // stack — OTA + web server need headroom
+        6144,       // stack — OTA + TCP server; no async lib overhead anymore
         this,
         1,          // priority: lower than all real-time threads
         &_task_handle,
@@ -97,7 +73,6 @@ void WifiThread::begin() {
 
 
 void WifiThread::loop() {
-    // Setup OTA + WebServer once WiFi is connected (lazy, avoids blocking boot).
     if (WiFi.status() == WL_CONNECTED) {
         if (_soft_ap_active) {
             _stopSoftAP();
@@ -105,8 +80,8 @@ void WifiThread::loop() {
         if (!_ota_setup_done) {
             _setupOTA();
         }
-        if (!_server_setup_done) {
-            _setupWebServer();
+        if (!_tcp_server_started) {
+            _setupTcpServer();
         }
         ArduinoOTA.handle();
 
@@ -132,8 +107,78 @@ void WifiThread::loop() {
         }
     }
 
-    // Clean up stale WebSocket connections.
-    g_ws.cleanupClients();
+    // ── Accept new TCP clients ──────────────────────────────────────────────
+    if (_tcp_server_started) {
+        WiFiClient incoming = _tcp_server.available();
+        if (incoming) {
+            bool placed = false;
+            for (auto& slot : _slots) {
+                if (!slot.client.connected()) {
+                    slot.client = incoming;
+                    slot.buf    = "";
+                    Serial.printf("[WIFI] TCP client connected from %s\n",
+                                  incoming.remoteIP().toString().c_str());
+                    // Greet with device info
+                    String hello = "{\"connected\":true,\"ip\":\"" + ip() +
+                                   "\",\"device\":\"" +
+                                   DeviceSettings::getInstance().deviceName +
+                                   "\",\"fw\":\"" +
+                                   DeviceSettings::getInstance().firmwareVersion +
+                                   "\"}";
+                    slot.client.println(hello);
+                    placed = true;
+                    break;
+                }
+            }
+            if (!placed) {
+                incoming.stop(); // no room — refuse gracefully
+                Serial.println("[WIFI] TCP: max clients reached, refused connection");
+            }
+        }
+    }
+
+    // ── Read inbound data from connected clients ────────────────────────────
+    for (auto& slot : _slots) {
+        if (!slot.client.connected()) continue;
+        while (slot.client.available()) {
+            char c = static_cast<char>(slot.client.read());
+            if (c == '\n' || c == '\r') {
+                if (slot.buf.length() > 0) {
+                    if (slot.buf.length() <= MAX_LINE_BYTES) {
+                        // Forward to com_thread for parsing (queue-based, no cross-task parse)
+                        com_thread.net_submit(new String(slot.buf));
+                    } else {
+                        Serial.printf("[WIFI] TCP: line too long (%u bytes), dropped\n",
+                                      (unsigned)slot.buf.length());
+                    }
+                    slot.buf = "";
+                }
+            } else {
+                if (slot.buf.length() < MAX_LINE_BYTES) {
+                    slot.buf += c;
+                } else {
+                    // Already overlong — keep consuming until newline to re-sync
+                    slot.buf += c; // allow length to exceed so we drop on newline
+                }
+            }
+        }
+    }
+
+    // ── Drain outbound queue → connected clients ────────────────────────────
+    // com_thread.emit() enqueues String* here; we own the pointer after dequeue.
+    if (_q_net_out != nullptr) {
+        String* frame = nullptr;
+        while (xQueueReceive(_q_net_out, &frame, 0) == pdTRUE && frame != nullptr) {
+            for (auto& slot : _slots) {
+                if (slot.client.connected()) {
+                    slot.client.print(*frame);
+                    if (!frame->endsWith("\n")) slot.client.print('\n');
+                }
+            }
+            delete frame;
+            frame = nullptr;
+        }
+    }
 }
 
 
@@ -159,7 +204,6 @@ void WifiThread::apply_settings() {
 
 void WifiThread::mark_ota_valid() {
     // Call ONLY after core threads + (optionally) connectivity are healthy.
-    // Cancels OTA rollback so the device won't revert on next reset.
     esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
     if (err == ESP_OK) {
         Serial.println("[WIFI] OTA rollback cancelled — firmware marked valid.");
@@ -198,36 +242,16 @@ void WifiThread::_connect() {
 
 void WifiThread::_startSoftAP() {
     if (_soft_ap_active) return;
-    Serial.printf("[WIFI] Starting SoftAP '%s'\n", SOFTAP_SSID);
+    Serial.printf("[WIFI] Starting SoftAP '%s' — connect and send JSON to port %u\n",
+                  SOFTAP_SSID, TCP_PORT);
     WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(SOFTAP_SSID); // open AP — user connects then submits form
+    WiFi.softAP(SOFTAP_SSID); // open AP — user connects, then uses TCP port
 
-    // Serve provisioning page only if server not already up.
-    if (!_server_setup_done) {
-        g_server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
-            req->send_P(200, "text/html", PROV_PAGE);
-        });
-        g_server.on("/prov", HTTP_POST, [](AsyncWebServerRequest* req) {
-            if (req->hasParam("ssid", true)) {
-                String ssid = req->getParam("ssid", true)->value();
-                String pw   = req->hasParam("pw", true)
-                              ? req->getParam("pw", true)->value()
-                              : "";
-                // Fix 1: use thread-safe NVS-persisting setters; remove bare
-                // public field writes and the manual ds.dirty=true.
-                DeviceSettings& ds = DeviceSettings::getInstance();
-                ds.setWifiSsid(ssid);
-                ds.setWifiPassword(pw);
-                ds.setWifiEnabled(true);
-                ds.toSPIFFS();
-                req->send(200, "text/plain", "Saved — connecting...");
-                wifi_thread.apply_settings();
-            } else {
-                req->send(400, "text/plain", "Missing ssid");
-            }
-        });
-        g_server.begin();
-        _server_setup_done = true;
+    // Start TCP server so provisioning commands can arrive over TCP even in AP mode.
+    if (!_tcp_server_started) {
+        _tcp_server.begin();
+        _tcp_server_started = true;
+        Serial.printf("[WIFI] TCP server started on port %u (SoftAP mode)\n", TCP_PORT);
     }
     _soft_ap_active = true;
 }
@@ -264,173 +288,16 @@ void WifiThread::_setupOTA() {
 }
 
 
-void WifiThread::_setupWebServer() {
-    // ── WebSocket handler ────────────────────────────────────────────────────
-    g_ws.onEvent([this](AsyncWebSocket* server,
-                        AsyncWebSocketClient* client,
-                        AwsEventType type,
-                        void* arg,
-                        uint8_t* data,
-                        size_t len) {
-        if (type == WS_EVT_DATA) {
-            AwsFrameInfo* info = reinterpret_cast<AwsFrameInfo*>(arg);
-            if (info->final && info->index == 0 && info->len == len &&
-                info->opcode == WS_TEXT) {
-                // Null-terminate and hand off.
-                String json = String(reinterpret_cast<char*>(data), len);
-                _handleWsCommand(json, client->id());
-            }
-        } else if (type == WS_EVT_CONNECT) {
-            Serial.printf("[WIFI] WS client #%u connected\n", client->id());
-            // Greet new client with device info.
-            JsonDocument hello;
-            hello["connected"] = true;
-            hello["ip"]        = ip();
-            hello["device"]    = DeviceSettings::getInstance().deviceName;
-            hello["fw"]        = DeviceSettings::getInstance().firmwareVersion;
-            String out;
-            serializeJson(hello, out);
-            client->text(out);
-        } else if (type == WS_EVT_DISCONNECT) {
-            Serial.printf("[WIFI] WS client #%u disconnected\n", client->id());
-        }
-    });
-
-    g_server.addHandler(&g_ws);
-
-    // ── HTTP firmware update endpoint (/update, multipart POST) ─────────────
-    g_server.on("/update", HTTP_POST,
-        // onComplete
-        [](AsyncWebServerRequest* req) {
-            bool ok = !Update.hasError();
-            req->send(200, "text/plain", ok ? "OK — rebooting" : "FAIL");
-            if (ok) {
-                vTaskDelay(pdMS_TO_TICKS(200));
-                ESP.restart();
-            }
-        },
-        // onUpload
-        [](AsyncWebServerRequest* req,
-           const String& filename,
-           size_t index,
-           uint8_t* data,
-           size_t len,
-           bool final) {
-            if (index == 0) {
-                int cmd = filename.endsWith(".spiffs") ? U_SPIFFS : U_FLASH;
-                if (!Update.begin(UPDATE_SIZE_UNKNOWN, cmd)) {
-                    Serial.printf("[OTA/HTTP] begin error: %s\n",
-                                  Update.errorString());
-                }
-            }
-            if (Update.isRunning())
-                Update.write(data, len);
-            if (final) {
-                if (!Update.end(true))
-                    Serial.printf("[OTA/HTTP] end error: %s\n",
-                                  Update.errorString());
-            }
-        }
-    );
-
-    // ── Simple status endpoint ───────────────────────────────────────────────
-    g_server.on("/status", HTTP_GET, [](AsyncWebServerRequest* req) {
-        JsonDocument doc;
-        doc["ip"]   = WiFi.localIP().toString();
-        doc["rssi"] = WiFi.RSSI();
-        doc["device"] = DeviceSettings::getInstance().deviceName;
-        doc["fw"]   = DeviceSettings::getInstance().firmwareVersion;
-        String out;
-        serializeJson(doc, out);
-        req->send(200, "application/json", out);
-    });
-
-    g_server.begin();
-    _server_setup_done = true;
-    Serial.printf("[WIFI] Web server ready — IP: %s\n", ip().c_str());
-}
-
-
-/**
- * _handleWsCommand — mirrors the serial JSON API from com_thread.
- *
- * Commands understood (same keys as serial path):
- *   profile, updates, current, R, settings, save, load, profiles,
- *   wifi  (set ssid/pw/wifiEnabled),
- *   sprite (forwarded to SpriteStore via com_thread queue if available).
- *
- * Every mutating command sends an ACK: { "ack":"<cmd>", "ok":true|false, "error":"..." }
- */
-void WifiThread::_handleWsCommand(const String& json, uint32_t client_id) {
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, json);
-    if (err) {
-        JsonDocument ack;
-        ack["ack"]   = "parse";
-        ack["ok"]    = false;
-        ack["error"] = err.c_str();
-        String out; serializeJson(ack, out);
-        g_ws.text(client_id, out);
-        return;
-    }
-
-    // ── wifi command — update DeviceSettings wifi fields ─────────────────
-    // Fix 1: use thread-safe NVS-persisting setters; remove bare field writes and ds.dirty=true.
-    if (!doc["wifi"].isNull()) {
-        JsonVariant w = doc["wifi"];
-        if (w.is<JsonObject>()) {
-            DeviceSettings& ds = DeviceSettings::getInstance();
-            JsonObject wobj = w.as<JsonObject>();
-            if (!wobj["ssid"].isNull())
-                ds.setWifiSsid(wobj["ssid"].as<String>());
-            if (!wobj["password"].isNull())
-                ds.setWifiPassword(wobj["password"].as<String>());
-            if (!wobj["enabled"].isNull())
-                ds.setWifiEnabled(wobj["enabled"].as<bool>());
-            // Non-blocking reconnect; integrator must call save separately.
-            apply_settings();
-        }
-        JsonDocument ack;
-        ack["ack"] = "wifi";
-        ack["ok"]  = true;
-        String out; serializeJson(ack, out);
-        g_ws.text(client_id, out);
-        return;
-    }
-
-    // ── All other commands — forward to com_thread by re-queuing as a
-    //    synthetic serial message through the existing string-message path.
-    //    We serialise back to a string and push it as if it came from serial.
-    //    com_thread.run() reads Serial; the cleanest bridge is to inject via
-    //    the existing put_string_message queue with type STRING_MESSAGE_DEBUG
-    //    is NOT correct here (that's for display).
-    //
-    //    Instead we echo the JSON onto the Serial TX line — since com_thread
-    //    owns Serial RX and we own Serial TX from the same UART this is the
-    //    correct IPC on a single-UART embedded system.  A more elegant
-    //    solution would require a separate inter-task queue added to com_thread
-    //    (tracked as an integrationHook).
-    //
-    //    For now, relay inbound WS JSON straight to the USB-CDC serial so
-    //    com_thread processes it identically to a host command.
-    Serial.println(json);  // com_thread will pick this up on its next iteration
-
-    // ACK is deferred — com_thread will emit the reply JSON which
-    // _wsBroadcast() will forward to all WS clients (see note below on
-    // broadcast hooking — this requires an integrationHook in com_thread).
-}
-
-
-void WifiThread::_wsBroadcast(const String& json) {
-    g_ws.textAll(json);
+void WifiThread::_setupTcpServer() {
+    _tcp_server.begin();
+    _tcp_server_started = true;
+    Serial.printf("[WIFI] TCP JSON server ready on %s:%u\n", ip().c_str(), TCP_PORT);
 }
 
 
 #else // !WIFI_ENABLED -------------------------------------------------------
 
 // Stub instance so the `wifi_thread` symbol exists in no-WiFi builds.
-// The header declares the matching stub class with inline no-op methods, so
-// callers (main.cpp, com_thread.cpp) link and compile to nothing.
 WifiThread wifi_thread;
 
 #endif // WIFI_ENABLED

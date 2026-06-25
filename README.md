@@ -39,7 +39,7 @@ Open a serial monitor at 115200 baud to observe boot output.
 | Environment | Extra features | Build flag(s) |
 |---|---|---|
 | `nanofoc_d` | Core only (default) | — |
-| `nanofoc_d_wifi` | WiFi STA + SoftAP provisioning + ArduinoOTA + WebSocket API | `-DWIFI_ENABLED` |
+| `nanofoc_d_wifi` | WiFi STA + SoftAP provisioning + ArduinoOTA + raw TCP JSON API (port 3333) | `-DWIFI_ENABLED` |
 | `nanofoc_d_audio` | I2S audio haptic feedback | `-DNANO_AUDIO=1 -DAUDIO_EN` |
 | `nanofoc_d_full` | WiFi + audio | both sets above |
 
@@ -98,7 +98,7 @@ Four FreeRTOS tasks run concurrently:
 | FOC | (configurable) | 8 192 B | SimpleFOC motor loop, haptic |
 | HMI | (configurable) | 4 608 B | LED ring, buttons, MIDI, USB HID, PD init |
 | LCD | (configurable) | (in lcd_thread) | GC9A01 display, LVGL |
-| WIFI (optional) | 0 | 8 192 B | WiFi STA/AP, ArduinoOTA, WebSocket |
+| WIFI (optional) | 0 | 6 144 B | WiFi STA/AP, ArduinoOTA, raw TCP JSON server (port 3333) |
 
 Shared state is protected by FreeRTOS recursive mutexes. The RAII helper `SemaphoreGuard` (`src/semaphore_guard.h`) ensures mutex release on scope exit. A global `atomic` `global_sleep_flag` signals idle state to the LED renderer.
 
@@ -107,10 +107,9 @@ Shared state is protected by FreeRTOS recursive mutexes. The RAII helper `Semaph
 Enabled by `-DWIFI_ENABLED`. Features:
 
 - **STA mode**: auto-connects to stored SSID with exponential-backoff reconnect.
-- **SoftAP provisioning**: if no credentials are stored, a captive network `NanoD-Setup` is started with a minimal HTML form at `http://192.168.4.1/`.
+- **SoftAP provisioning**: if no credentials are stored, an open access point `NanoD-Setup` is started. Connect to it, then open a raw TCP connection to `192.168.4.1:3333` and send `{"wifi":{"ssid":"...","password":"...","enabled":true}}\n` to provision credentials.
 - **ArduinoOTA**: OTA update over the local network (password: `nanod-ota` by default, overridable via `-DWIFI_OTA_PASSWORD`).
-- **AsyncWebSocket** at `/ws`: mirrors the full serial JSON API. Commands sent over WebSocket are processed identically to serial commands.
-- **HTTP firmware update** at `POST /update` (multipart).
+- **Raw TCP JSON server** on port 3333: mirrors the full serial JSON API. Inbound lines are queued to `com_thread` for parsing; all outbound frames (ACKs, events, replies) are mirrored back to connected TCP clients via `com_thread.emit()`. Up to 4 simultaneous clients; lines > 2048 bytes are dropped.
 - **OTA rollback**: `wifi_thread.mark_ota_valid()` calls `esp_ota_mark_app_valid_cancel_rollback()` after all threads have started; if the device crashes before that call the bootloader rolls back to the previous firmware.
 
 ### Sprite store

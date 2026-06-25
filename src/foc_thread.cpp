@@ -87,6 +87,11 @@ void FocThread::run() {
             AngleEvt ae = { haptic.haptic_state.current_pos };
             xQueueSend(_q_angleevt_out, &ae, (TickType_t)0);
             serial_last_pos = haptic.haptic_state.current_pos;
+            // Relaxed stores: HMI thread on core 0 reads these via relaxed loads in
+            // pass_cur_pos/pass_start_pos/pass_end_pos — no torn-read, no mutex needed.
+            _a_cur_pos.store(haptic.haptic_state.current_pos, std::memory_order_relaxed);
+            _a_start_pos.store(haptic.haptic_state.detent_profile.start_pos, std::memory_order_relaxed);
+            _a_end_pos.store(haptic.haptic_state.detent_profile.end_pos, std::memory_order_relaxed);
         }
         
         
@@ -123,15 +128,16 @@ uint16_t FocThread::pass_actual_pos(){
 }
 
 uint16_t FocThread::pass_cur_pos(){
-    return haptic.haptic_state.current_pos;
+    // Relaxed load: safe cross-core read of atomic shadow; no mutex needed.
+    return _a_cur_pos.load(std::memory_order_relaxed);
 }
 
 uint16_t FocThread::pass_start_pos(){
-    return haptic.haptic_state.detent_profile.start_pos;
+    return _a_start_pos.load(std::memory_order_relaxed);
 }
 
 uint16_t FocThread::pass_end_pos(){
-    return haptic.haptic_state.detent_profile.end_pos;
+    return _a_end_pos.load(std::memory_order_relaxed);
 }
 
 uint16_t FocThread::pass_last_pos(){
@@ -172,6 +178,10 @@ void FocThread::handleHapticConfig() {
     if (xQueueReceive(_q_haptic_in, &profile, (TickType_t)0)) {
         // apply haptic config to motor
         haptic.haptic_state = HapticState(profile);
+        // Keep atomic shadows consistent after full profile replacement.
+        _a_cur_pos.store(haptic.haptic_state.current_pos, std::memory_order_relaxed);
+        _a_start_pos.store(haptic.haptic_state.detent_profile.start_pos, std::memory_order_relaxed);
+        _a_end_pos.store(haptic.haptic_state.detent_profile.end_pos, std::memory_order_relaxed);
     }
 };
 

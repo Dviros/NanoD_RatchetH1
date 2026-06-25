@@ -40,6 +40,8 @@ public:
     void play_haptic_audio();
     void audio_loop();
     bool check_file(String fName, uint8_t* audio_file);
+    // public read of the active feedback level (free helpers play at this volume)
+    uint16_t feedback_lvl() const { return audio_config.audio_feedback_lvl; }
 protected:
     void handle_audio_commands();
     void start_play(uint8_t* audio_file);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <atomic>
 #include "thread_crtp.h"
 #include "haptic.h"
 #include "nanofoc_d.h"
@@ -47,6 +48,13 @@ class FocThread : public Thread<FocThread> {
         QueueHandle_t _q_motor_in;
         QueueHandle_t _q_haptic_in;
         QueueHandle_t _q_angleevt_out;
+
+        // Cross-core shadow of haptic_state scalars. Written on core 1 (FOC loop)
+        // with relaxed stores; read on core 0 (HMI/LCD) with relaxed loads — avoids
+        // torn reads without any blocking in the real-time path.
+        std::atomic<uint16_t> _a_cur_pos{0};
+        std::atomic<uint16_t> _a_start_pos{0};
+        std::atomic<uint16_t> _a_end_pos{0};
 };
 
 extern FocThread foc_thread;

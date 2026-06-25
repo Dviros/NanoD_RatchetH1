@@ -20,7 +20,7 @@ void audio_play(SoundId id) {
         case SOUND_CHIME: wav = chime_wav; break;
         default: break;
     }
-    if (wav) audioPlayer.play_audio(wav, audioPlayer.audio_config.audio_feedback_lvl);
+    if (wav) audioPlayer.play_audio(wav, audioPlayer.feedback_lvl());
 #else
     (void)id;
 #endif

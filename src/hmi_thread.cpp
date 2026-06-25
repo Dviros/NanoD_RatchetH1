@@ -592,8 +592,14 @@ PowerType HmiThread::init_pd() {
             uint8_t b1 = Wire.read();
             uint8_t b2 = Wire.read();
             uint8_t b3 = Wire.read();
-            // RDO object position is in bits [30:28] of the 32-bit register (big-endian)
+            // RDO object position is in bits [30:28] of the 32-bit register (big-endian).
+            // See docs/KNOWN_RESIDUALS.md — byte ordering unverified on hardware; use
+            // -DPD_RDO_ALT_BYTE to test big-endian first byte (b0) instead of b3.
+#ifdef PD_RDO_ALT_BYTE
+            selected_pdo = (b0 >> 4) & 0x07;
+#else
             selected_pdo = (b3 >> 4) & 0x07;
+#endif
             if (selected_pdo == 0) selected_pdo = 1; // 0 means no contract yet
         }
     }

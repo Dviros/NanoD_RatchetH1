@@ -180,21 +180,22 @@ desktop application (`app/`).
   `WiFi.begin()` non-blocking; `loop()` polls `WL_CONNECTED` and retries with
   backoff from `BACKOFF_MIN_MS` doubling to `BACKOFF_MAX_MS`.
 - **SoftAP provisioning**: if `wifiEnabled` is true but no SSID is stored, the
-  chip opens a `WIFI_AP_STA` access point (`SOFTAP_SSID`, open, no password).
-  A minimal provisioning form is served at `/` via `ESPAsyncWebServer`; a POST
-  to `/prov` stores credentials to `DeviceSettings` + NVS and triggers a fresh
-  `_connect()`.
+  chip opens a `WIFI_AP_STA` access point (`SOFTAP_SSID = "NanoD-Setup"`, open,
+  no password). The raw TCP server is started immediately in AP mode; connect to
+  the AP then send `{"wifi":{"ssid":"...","password":"...","enabled":true}}\n`
+  to `192.168.4.1:3333` to provision credentials and trigger `_connect()`.
 - **ArduinoOTA**: once STA is connected, `ArduinoOTA` is started with
   password `WIFI_OTA_PASSWORD` (default `nanod-ota`, configurable via build
   flag) and the device hostname set from `DeviceSettings::deviceName`.
-- **AsyncWebSocket at `/ws`**: mirrors the serial JSON API. Inbound WS frames
-  are parsed identically to serial frames; `wifi` commands are handled locally
-  in `_handleWsCommand()`; all other commands are relayed to `Serial` so
-  `com_thread` processes them.
-- **HTTP firmware update at `/update`** (multipart POST): supports both
-  `U_FLASH` (`.bin`) and `U_SPIFFS` (`.spiffs`) targets.
-- **Status endpoint at `/status`** (HTTP GET): returns
-  `{"ip":"...","rssi":-N,"device":"...","fw":"..."}`.
+- **Raw TCP JSON server on port 3333** (`WifiThread::TCP_PORT`): mirrors the
+  serial JSON API. Up to `MAX_TCP_CLIENTS` (4) simultaneous connections.
+  Inbound newline-delimited lines are forwarded to `com_thread` via
+  `net_submit()`; lines longer than `MAX_LINE_BYTES` (2048 bytes) are dropped.
+  All outbound frames pass through `com_thread.emit()`, which enqueues a heap
+  copy to the `_q_net_out` FreeRTOS queue; `wifi_thread` drains that queue each
+  loop iteration and `client.println()`s each frame to connected clients.
+  `ESPAsyncWebServer`, `AsyncTCP`, WebSocket (`/ws`), HTTP `/update`, and HTTP
+  `/status` are no longer used or compiled.
 - **OTA rollback**: `WifiThread::mark_ota_valid()` calls
   `esp_ota_mark_app_valid_cancel_rollback()`. `main.cpp` calls this 2 seconds
   after all threads start. If the device reboots before this point (e.g. crash
@@ -304,7 +305,7 @@ Four named envs replace the single env:
 | Env | Feature set | Extra flags / deps |
 |---|---|---|
 | `nanofoc_d` (default) | Core: bug fixes, PD, sprites, brick-proofing | — |
-| `nanofoc_d_wifi` | + WiFi STA, ArduinoOTA, AsyncWebSocket | `-DWIFI_ENABLED`, `ESPAsyncWebServer-esphome@^3.1.0` |
+| `nanofoc_d_wifi` | + WiFi STA, ArduinoOTA, raw TCP JSON server (port 3333) | `-DWIFI_ENABLED` (arduino-esp32 core only; `ESPAsyncWebServer-esphome` removed) |
 | `nanofoc_d_audio` | + I2S audio feedback | `-DNANO_AUDIO=1 -DAUDIO_EN` |
 | `nanofoc_d_full` | WiFi + audio | all of the above |
 
@@ -314,8 +315,7 @@ RAM 46.8%.
 #### Firmware version string
 
 `-DNANO_FIRMWARE_VERSION=\"1.1.0\"` set in `platformio.ini`. Exposed over
-serial as `settings.firmwareVersion` and over WebSocket in the `connected`
-greeting.
+serial as `settings.firmwareVersion` and in the TCP `connected` greeting.
 
 ---
 
@@ -493,7 +493,7 @@ Response for all operations:
 | `fw/src/hmi_thread.cpp` | Fixed: LED bounds, idle-LED loop, LongPress dispatch, `init_pd()` full rewrite |
 | `fw/src/foc_thread.cpp` | Fixed: `driver.voltage_power_supply` from `DeviceSettings.pdVoltage` |
 | `fw/src/com_thread.cpp` | Fixed: serial timeout, message command, profile reorder, heap leak, bare prints; added ACKs, richer telemetry, `wifi`/`sprite` routing |
-| `fw/src/wifi_thread.cpp` | New: full WiFi STA/AP/OTA/WebSocket/HTTP implementation; stub when `WIFI_ENABLED` not defined |
+| `fw/src/wifi_thread.cpp` | New: WiFi STA/AP/OTA + raw TCP JSON server (port 3333); replaces ESPAsyncWebServer/AsyncTCP; stub when `WIFI_ENABLED` not defined |
 | `fw/src/wifi_thread.h` | New: `WifiThread` class + no-op stub |
 | `fw/src/sprite_store.cpp` | New: chunked upload, LittleFS storage, CRC, LVGL 'L:' driver |
 | `fw/src/sprite_store.h` | New: `SpriteStore` namespace |

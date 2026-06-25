@@ -5,13 +5,16 @@
 // Guard: this entire module is optional. Define WIFI_ENABLED in build flags to activate.
 #ifdef WIFI_ENABLED
 
-#include <ArduinoJson.h>
+#include <WiFiServer.h>
+#include <WiFiClient.h>
+#include <freertos/queue.h>
 
 /**
- * WifiThread — FW6
+ * WifiThread — FW6 (lean TCP transport)
  *
  * Manages WiFi station connection (from DeviceSettings), SoftAP provisioning
- * fallback, ArduinoOTA, and an AsyncWebSocket that mirrors the serial JSON API.
+ * fallback (credentials accepted over TCP on port 3333), ArduinoOTA, and a
+ * raw WiFiServer on TCP_PORT that mirrors the serial JSON API.
  *
  * CONTRACT (shared interface — do NOT rename):
  *   void begin()            — call once from setup(), after DeviceSettings is ready.
@@ -22,6 +25,15 @@
  *
  * The FreeRTOS task entry is wifi_thread_task() (static, pinned core 0, priority 1).
  * Integrator starts it by calling wifi_thread.begin() which also creates the task.
+ *
+ * TCP transport design:
+ *   - WiFiServer listens on TCP_PORT (3333).
+ *   - Accepts up to MAX_TCP_CLIENTS clients; reads newline-delimited JSON lines.
+ *   - Lines > MAX_LINE_BYTES are silently dropped (buffer-overflow guard).
+ *   - Inbound lines → com_thread.net_submit(new String(line)) [queued, not parsed here].
+ *   - Outbound frames arrive via _q_net_out (String* heap ptrs written by com_thread.emit()).
+ *     wifi_thread drains that queue and client.println()s each frame, then deletes the ptr.
+ *   - No cross-task socket or parser access anywhere.
  */
 class WifiThread {
 public:
@@ -34,6 +46,13 @@ public:
     // Watchdog helper — call from any task to register it with the task WDT.
     static void addCurrentTask();
 
+    // TCP port for the raw JSON API
+    static constexpr uint16_t TCP_PORT      = 3333;
+    // Max clients held open simultaneously
+    static constexpr uint8_t  MAX_TCP_CLIENTS = 4;
+    // Max inbound line length (bytes); longer lines are dropped
+    static constexpr size_t   MAX_LINE_BYTES  = 2048;
+
 private:
     // Internal task bookkeeping
     static void taskEntry(void* param);
@@ -44,18 +63,26 @@ private:
     void _startSoftAP();
     void _stopSoftAP();
     void _setupOTA();
-    void _setupWebServer();
+    void _setupTcpServer();
 
-    // Broadcast a JSON string to all connected WebSocket clients
-    // (mirrors serial output so the app can connect over WiFi).
-    void _wsBroadcast(const String& json);
+    // Per-client state: accumulated partial line
+    struct ClientSlot {
+        WiFiClient client;
+        String     buf;   // partial line accumulator
+    };
 
-    // WebSocket JSON command handler (same contract as com_thread serial path)
-    void _handleWsCommand(const String& json, uint32_t client_id);
+    ClientSlot _slots[MAX_TCP_CLIENTS];
 
-    bool _ota_setup_done     = false;
-    bool _server_setup_done  = false;
-    bool _soft_ap_active     = false;
+    // FW6: raw TCP server (replaces AsyncWebServer + g_ws)
+    WiFiServer _tcp_server{TCP_PORT};
+    bool _tcp_server_started = false;
+
+    // FW6: outbound queue registered with com_thread.
+    // Items are String* allocated by com_thread.emit(); we delete after sending.
+    QueueHandle_t _q_net_out = nullptr;
+
+    bool _ota_setup_done    = false;
+    bool _soft_ap_active    = false;
 
     // Reconnect backoff (ms)
     unsigned long _last_connect_attempt = 0;

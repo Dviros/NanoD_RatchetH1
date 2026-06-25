@@ -65,15 +65,26 @@
 #define PIN_SERIAL2_RX 44
 #define PIN_SERIAL2_TX 43
 
-// Misc
+// Misc — optional features default OFF but are overridable from build_flags
+// (e.g. -DNANO_AUDIO=1). Without the #ifndef guard the header would clobber the
+// command-line define, leaving WavData*.cpp (no header) and audio.cpp (header)
+// disagreeing on NANO_AUDIO -> ODR/multiple-definition link error.
+#ifndef NANO_FS
 #define NANO_FS 0
+#endif
+#ifndef NANO_DISPLAY
 #define NANO_DISPLAY 0
+#endif
+#ifndef NANO_AUDIO
 #define NANO_AUDIO 0
+#endif
 #define NANO_LED 1
 #define NANO_MOTOR 1
 #define NANO_KEY 1
 #define NANO_MODE 1
+#ifndef NANO_MIDI
 #define NANO_MIDI 0
+#endif
 #define NANO_PWM_FREQ 0
 #define NANO_LOOP_FREQ 0
 #define NANO_SPI0_FREQ 0
