@@ -32,6 +32,11 @@ static constexpr size_t  MAX_SPRITE_SIZE   = 64  * 1024;  // 64 KB per static sp
 static constexpr size_t  MAX_GIF_SIZE      = 200 * 1024;  // 200 KB per GIF sprite
 static constexpr size_t  MAX_SPRITES_BYTES = 768 * 1024;  // 768 KB total (raised from 512 KB for GIF)
 static constexpr uint8_t MAX_SPRITES       = 16;
+// GIF logical-screen cap. gifdec allocates one contiguous 5*w*h block; 240x240
+// (the panel size) = 281 KB, which fits the 2 MB LVGL pool with margin. Anything
+// larger is rejected at upload so it can never OOM-hang the LCD. Bytes-size alone
+// is insufficient: a tiny highly-compressed GIF can still declare huge dimensions.
+static constexpr uint16_t MAX_GIF_DIM      = 240;
 static const char*       SPRITE_DIR        = "/sprites";
 
 // ---------------------------------------------------------------------------
@@ -271,6 +276,18 @@ static bool handle_end(JsonObjectConst cmd, String& err) {
         return false;
     }
 
+    // GIF safety gate: verify magic + cap dimensions so the decoder's single
+    // 5*w*h allocation can never OOM-hang the LCD. Reject + delete unsafe GIFs.
+    if (is_gif_name(g_upload.name.c_str())) {
+        String gerr;
+        if (!SpriteStore::gifRenderable(g_upload.name, gerr)) {
+            LittleFS.remove(SpriteStore::pathFor(g_upload.name).c_str());
+            g_upload.active = false;
+            err = gerr;
+            return false;
+        }
+    }
+
     g_upload.active = false;
     return true;
 }
@@ -387,6 +404,32 @@ void registerLvglDriver() {
     // write_cb left null — read-only driver sufficient for image display
     lv_fs_drv_register(&s_lvfs_drv);
     Serial.println("[SpriteStore] LVGL 'L:' driver registered");
+}
+
+// GIF safety gate. gifdec does ONE contiguous lv_malloc of 5*w*h bytes; an
+// oversized GIF would exceed the LVGL pool and OOM-hang the LCD task (the
+// LV_USE_ASSERT_MALLOC handler is a while(1)). Verify the magic and cap the
+// logical-screen dimensions so the decode can never exceed the pool. Used both
+// at upload (reject bad GIFs) and before render (last line of defense).
+bool gifRenderable(const String& name, String& err) {
+    File f = LittleFS.open(pathFor(name).c_str(), "r");
+    if (!f) { err = "cannot open gif"; return false; }
+    uint8_t hdr[10];
+    size_t n = f.read(hdr, sizeof(hdr));
+    f.close();
+    if (n < sizeof(hdr)) { err = "gif too short"; return false; }
+    if (memcmp(hdr, "GIF8", 4) != 0 ||
+        (hdr[4] != '7' && hdr[4] != '9') || hdr[5] != 'a') {
+        err = "not a valid GIF (bad magic)"; return false;
+    }
+    uint16_t w = (uint16_t)hdr[6] | ((uint16_t)hdr[7] << 8);  // logical screen w, LE
+    uint16_t h = (uint16_t)hdr[8] | ((uint16_t)hdr[9] << 8);  // logical screen h, LE
+    if (w == 0 || h == 0 || w > MAX_GIF_DIM || h > MAX_GIF_DIM) {
+        err = "GIF " + String(w) + "x" + String(h) + " exceeds " +
+              String(MAX_GIF_DIM) + "x" + String(MAX_GIF_DIM) + " limit";
+        return false;
+    }
+    return true;
 }
 
 bool handleCommand(JsonObjectConst cmd, String& err) {

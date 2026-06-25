@@ -63,6 +63,15 @@ namespace SpriteStore {
     bool exists(const String& name);
 
     /**
+     * GIF safety gate. True only if <name> is a valid GIF whose logical-screen
+     * dimensions are within MAX_GIF_DIM (240x240). gifdec allocates one
+     * contiguous 5*w*h block; an oversized GIF would exceed the LVGL pool and
+     * OOM-hang the LCD task. Checked at upload AND before render. On false,
+     * err holds the reason.
+     */
+    bool gifRenderable(const String& name, String& err);
+
+    /**
      * Fix 6: populate arr with {name, size} JSON objects for every stored sprite.
      * Call this from the "list" command handler in com_thread to build the
      * {"sprites":[{"name":"..","size":N},...]} response frame.

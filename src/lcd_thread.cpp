@@ -11,9 +11,14 @@ TFT_eSPI tft;
 // the stdlib header explicitly to ensure it is available.
 #include <lvgl.h>
 
-// PSRAM pool size for LVGL GIF decode (240x240 RGB565 = 112 KB per frame,
-// allocate 256 KB to accommodate multi-frame GIF decode + overhead).
-static constexpr size_t LV_PSRAM_POOL_SIZE = 256 * 1024U;
+// PSRAM pool for LVGL GIF decode. gifdec does ONE contiguous lv_malloc of
+// 5*w*h bytes (4*w*h RGBA canvas + 1*w*h index frame), NOT an RGB565 buffer:
+// a 240x240 GIF therefore needs 5*240*240 = 281 KB in a single block. The old
+// 256 KB pool was < that single alloc, so the malloc failed and LV_USE_ASSERT_MALLOC
+// hung the LCD task (while(1)) → black screen → power cycle. 2 MB gives ~7x margin
+// over a max 240x240 GIF and leaves 6 MB PSRAM free. Dimensions are also capped at
+// upload time (SpriteStore::gifRenderable) so the alloc can never exceed this pool.
+static constexpr size_t LV_PSRAM_POOL_SIZE = 2 * 1024 * 1024U;
 
 // GIF widget — only one active at a time; recreated when sprite changes.
 static lv_obj_t* s_gif_obj = nullptr;
@@ -276,6 +281,16 @@ void lcd_show_sprite(const String& name) {
 
     if (is_gif) {
 #if LV_USE_GIF
+        // Last line of defense: never hand the decoder a GIF that could OOM-hang
+        // the LCD task. Upload gates this too, but a sprite stored by older
+        // firmware may predate the check — fall back to the dial instead.
+        String gerr;
+        if (!SpriteStore::gifRenderable(name, gerr)) {
+            Serial.printf("[LCD] sprite '%s' refused: %s\n", name.c_str(), gerr.c_str());
+            lv_obj_del(s_sprite_layer);
+            s_sprite_layer = nullptr;
+            return;
+        }
         s_gif_obj = lv_gif_create(s_sprite_layer);
         if (s_gif_obj) {
             lv_gif_set_src(s_gif_obj, lvPath.c_str());
@@ -319,7 +334,8 @@ void LcdThread::run() {
     void* psram_buf = ps_malloc(LV_PSRAM_POOL_SIZE);
     if (psram_buf) {
         lv_mem_add_pool(psram_buf, LV_PSRAM_POOL_SIZE);
-        Serial.println("[LCD] LVGL PSRAM pool 256 KB registered");
+        Serial.printf("[LCD] LVGL PSRAM pool %u KB registered\n",
+                      (unsigned)(LV_PSRAM_POOL_SIZE / 1024));
     } else {
         Serial.println("[LCD] PSRAM pool alloc failed — GIF decode will use SRAM (may OOM for large GIFs)");
     }
