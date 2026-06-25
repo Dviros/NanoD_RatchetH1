@@ -9,10 +9,15 @@
 // FW3: route "wifi" and "sprite" commands per shared contract
 #include "./wifi_thread.h"
 #include "./sprite_store.h"
+// FW7: reboot + bootloader-download-mode support
+#include <esp_system.h>   // esp_restart()
+#include <soc/rtc_cntl_reg.h>  // REG_WRITE, RTC_CNTL_OPTION1_REG for force-download-boot
 
 
 
-ComThread::ComThread(const uint8_t task_core) : Thread("COM", 12000, 1, task_core) {
+// Priority 3: raised from 1 → 3 (FW7: prevent command processing starvation by
+// LVGL/HMI at priority 1; still below WIFI task at 5 and FOC real-time task).
+ComThread::ComThread(const uint8_t task_core) : Thread("COM", 12000, 3, task_core) {
     _q_strings_in = xQueueCreate(5, sizeof( StringMessage ));
 };
 
@@ -324,6 +329,48 @@ void ComThread::processCommand(JsonDocument& doc, ComThread& self) {
         serializeJson(pdDoc, frame);
         self.emit(frame);
       }
+    }
+
+    // FW7: net diagnostics — {"net":"?"} or {"net":"status"}
+    // Reply: {"net":{"rssi":<dBm>,"ip":"<ip>","ps":"NONE|MIN|MAX","heap":<bytes>,"uptime":<ms>,"clients":<n>}}
+    // In no-WiFi builds wifi_thread.netStatusJson() returns {"net":{"enabled":false}}.
+    v = doc["net"];
+    if (v.is<String>()) {
+      String netCmd = v.as<String>();
+      if (netCmd == "?" || netCmd == "status") {
+        String frame = wifi_thread.netStatusJson();
+        self.emit(frame);
+      }
+    }
+
+    // FW7: reboot commands.
+    // {"reboot":true}           → ACK then normal warm restart via esp_restart().
+    // {"reboot":"bootloader"}   → ACK then ROM download-mode restart (ESP32-S3).
+    //   The RTC_CNTL_OPTION1_REG bit 0 (RTC_CNTL_FORCE_DOWNLOAD_BOOT) tells the
+    //   ROM to enter UART download mode instead of booting the flash image.
+    //   This is the same mechanism used by esptool.py after the DTR/RTS dance;
+    //   doing it in firmware means the host only needs a plain USB-SERIAL open
+    //   (no control-line toggling required).
+    v = doc["reboot"];
+    if (!v.isNull()) {
+      if (v.is<bool>() && v.as<bool>() == true) {
+        self.sendAck("reboot", true);
+        vTaskDelay(pdMS_TO_TICKS(20)); // let ACK flush over Serial/TCP before reset
+        esp_restart();
+      } else if (v.is<String>() && v.as<String>() == "bootloader") {
+        self.sendAck("reboot", true);
+        vTaskDelay(pdMS_TO_TICKS(20)); // let ACK flush before reset
+        // Set the ROM force-download-boot flag in RTC slow memory.
+        // REG_WRITE/REG_READ are IDF macros for volatile MMIO access.
+        // RTC_CNTL_FORCE_DOWNLOAD_BOOT (BIT(0) of RTC_CNTL_OPTION1_REG) is
+        // the documented bit the ROM checks on every reset to decide whether to
+        // enter UART download mode (same path as the DTR/RTS esptool dance).
+        REG_WRITE(RTC_CNTL_OPTION1_REG,
+                  REG_READ(RTC_CNTL_OPTION1_REG) | RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+        esp_restart();
+      }
+      // Any other value for "reboot" is silently ignored — avoids accidental
+      // reboots from future protocol extensions that happen to use the same key.
     }
 }
 

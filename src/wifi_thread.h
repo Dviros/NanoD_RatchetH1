@@ -43,6 +43,10 @@ public:
     void mark_ota_valid();
     String ip();
 
+    // Returns a JSON status object for the {"net":"?"} diagnostic command.
+    // {"net":{"rssi":<dBm>,"ip":"<ip>","ps":"NONE|MIN|MAX","heap":<bytes>,"uptime":<ms>,"clients":<n>}}
+    String netStatusJson();
+
     // Watchdog helper — call from any task to register it with the task WDT.
     static void addCurrentTask();
 
@@ -136,6 +140,11 @@ public:
     inline void mark_ota_valid() {}
     inline String ip()           { return ""; }
     static inline void addCurrentTask() {}
+
+    // No-WiFi stub: caller gets a minimal object so it can still emit the frame.
+    inline String netStatusJson() {
+        return "{\"net\":{\"enabled\":false}}";
+    }
 };
 
 extern WifiThread wifi_thread;

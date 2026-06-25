@@ -13,8 +13,10 @@
 #include <WiFiServer.h>
 #include <WiFiClient.h>
 #include <ArduinoOTA.h>
+#include <ESPmDNS.h>      // MDNS.addService — also used by ArduinoOTA internally
 #include <esp_ota_ops.h>
 #include <esp_task_wdt.h>
+#include <esp_wifi.h>     // esp_wifi_get_ps() for power-save mode query
 #include <freertos/queue.h>
 
 // ─── global singleton ────────────────────────────────────────────────────────
@@ -62,13 +64,16 @@ void WifiThread::begin() {
     }
     // else: wifi disabled — don't touch the radio.
 
-    // Start internal FreeRTOS task, pinned to core 0, low priority.
+    // Start internal FreeRTOS task, pinned to core 0.
+    // Priority 5: above COM (3) and HMI/LCD (1) so the TCP socket + out-queue
+    // drain promptly rather than round-robining with LVGL at the same priority.
+    // Still well below the WiFi driver task (~18-23) and the FOC real-time task.
     xTaskCreatePinnedToCore(
         WifiThread::taskEntry,
         "WIFI",
         6144,       // stack — OTA + TCP server; no async lib overhead anymore
         this,
-        1,          // priority: lower than all real-time threads
+        5,          // priority: raised from 1 → 5 (FW7: latency fix hypothesis)
         &_task_handle,
         0           // core 0
     );
@@ -388,6 +393,64 @@ String WifiThread::ip() {
 }
 
 
+// ─── Net status diagnostic ────────────────────────────────────────────────────
+// Returns the JSON body for the {"net":"?"} command.  All fields are read
+// atomically (WiFi driver owns them; safe to call from com_thread context).
+String WifiThread::netStatusJson() {
+    // RSSI: meaningful only in STA mode with an active link.
+    int32_t rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+
+    // IP: STA address when connected, SoftAP address otherwise.
+    String ipStr = ip();  // already handles both cases
+
+    // Power-save mode — map esp_ps_type_t to a readable token.
+    wifi_ps_type_t psType = WIFI_PS_NONE;
+    esp_wifi_get_ps(&psType);  // returns ESP_OK; ignore error (field stays NONE)
+    const char* psStr;
+    switch (psType) {
+        case WIFI_PS_MIN_MODEM:  psStr = "MIN";  break;
+        case WIFI_PS_MAX_MODEM:  psStr = "MAX";  break;
+        default:                 psStr = "NONE"; break;
+    }
+
+    // Free heap (total, all regions).
+    uint32_t freeHeap = ESP.getFreeHeap();
+
+    // Uptime in milliseconds.
+    unsigned long uptimeMs = millis();
+
+    // Connected + authenticated client count.
+    uint8_t clientCount = 0;
+    for (auto& slot : _slots) {           // non-const: WiFiClient::connected() isn't const
+        if (slot.client.connected() &&
+            slot.authState == ClientSlot::AuthState::AUTHED)
+        {
+            clientCount++;
+        }
+    }
+
+    // Build the JSON string manually to avoid pulling ArduinoJson into this TU
+    // (it is already included via wifi_thread.h → Arduino.h chain but we keep
+    // the output predictable and avoid a heap-allocated JsonDocument here).
+    String out;
+    out.reserve(120);
+    out  = "{\"net\":{\"rssi\":";
+    out += rssi;
+    out += ",\"ip\":\"";
+    out += ipStr;
+    out += "\",\"ps\":\"";
+    out += psStr;
+    out += "\",\"heap\":";
+    out += freeHeap;
+    out += ",\"uptime\":";
+    out += (uint32_t)uptimeMs;
+    out += ",\"clients\":";
+    out += clientCount;
+    out += "}}";
+    return out;
+}
+
+
 // ─── Private helpers ─────────────────────────────────────────────────────────
 
 void WifiThread::_connect() {
@@ -452,8 +515,20 @@ void WifiThread::_setupOTA() {
     });
 
     ArduinoOTA.begin();
+    // ArduinoOTA.begin() calls MDNS.begin() internally; the mDNS responder is
+    // now running.  Register the _nanod._tcp service so the companion app can
+    // discover Nano devices without knowing the IP address.
+    // TXT records carry enough metadata to match / fingerprint the device.
+    DeviceSettings& _ds = DeviceSettings::getInstance();
+    MDNS.addService("nanod", "tcp", TCP_PORT);
+    MDNS.addServiceTxt("nanod", "tcp", "name",  _ds.deviceName.c_str());
+    MDNS.addServiceTxt("nanod", "tcp", "mac",   _ds.serialNumber.c_str());
+    MDNS.addServiceTxt("nanod", "tcp", "fw",    _ds.firmwareVersion.c_str());
+    MDNS.addServiceTxt("nanod", "tcp", "proto", "1");
     _ota_setup_done = true;
     Serial.println("[WIFI] ArduinoOTA ready");
+    Serial.printf("[WIFI] mDNS: _nanod._tcp registered (name=%s)\n",
+                  _ds.deviceName.c_str());
 }
 
 
