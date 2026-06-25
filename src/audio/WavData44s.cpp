@@ -1,6 +1,6 @@
 
 
-#if defined(USE_AUDIO_LIB)
+#if NANO_AUDIO && defined(USE_AUDIO_LIB)
 
 #include <inttypes.h>
 

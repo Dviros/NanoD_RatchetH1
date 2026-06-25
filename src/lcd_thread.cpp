@@ -1,8 +1,10 @@
 #include <Arduino.h>
 #include "lcd_thread.h"
+#include "sprite_store.h"    // SpriteStore::pathFor, SpriteStore::exists
+#include "DeviceSettings.h"  // DeviceSettings::getInstance().activeSprite
 
-// TODO: See if can do it more elegantly from LVGL tfteSPI driver 
-#include <TFT_eSPI.h> 
+// TODO: See if can do it more elegantly from LVGL tfteSPI driver
+#include <TFT_eSPI.h>
 TFT_eSPI tft;
 
 
@@ -170,11 +172,11 @@ if (lv_scr_act()==ui_profSelectScreen) // Profile Selection Screen
 
 
 static void counter_handler(lv_timer_t * postimer) {
-    static uint16_t last_pos = -1; // Default Last Position
+    static uint16_t last_pos = -1;      // Default Last Position
+    static uint16_t last_end_pos = 0;   // Init to 0 to avoid spurious arc range update on first call
     static bool overlay_toggle = false; // Default Overlay Toggle
     uint16_t pos = foc_thread.pass_cur_pos(); // Get Current Position from FOC Thread
     uint16_t end_pos = foc_thread.pass_end_pos(); // Get End Position from FOC Thread
-    uint16_t last_end_pos;
     
     if (pos != last_pos) {
        
@@ -220,6 +222,43 @@ static void counter_handler(lv_timer_t * postimer) {
 }
 
 
+/* ---------------------------------------------------------------------------
+ * lcd_show_sprite() — call ONLY from within the LVGL task (lcd_manager timer
+ * or the LcdThread::run loop) so we don't need an external mutex.
+ *
+ * Sets the lv_img source to "L:<path>" where 'L' is the LittleFS LVGL
+ * driver letter registered by SpriteStore::begin().  Hides the widget when
+ * name is empty or the sprite doesn't exist.
+ * -------------------------------------------------------------------------*/
+void lcd_show_sprite(const String& name) {
+    if (!ui_spriteImg) return; // ui not yet initialised
+
+    if (name.length() == 0 || !SpriteStore::exists(name)) {
+        lv_obj_add_flag(ui_spriteImg, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    // Build the LVGL fs path: "L:/sprites/<name>"
+    // 'L' is the drive letter registered in SpriteStore::begin() for LittleFS.
+    String lvPath = "L:" + SpriteStore::pathFor(name);
+
+    // lv_img_set_src accepts a C-string path when LV_USE_FS_* is enabled.
+    lv_img_set_src(ui_spriteImg, lvPath.c_str());
+    lv_obj_remove_flag(ui_spriteImg, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* ---------------------------------------------------------------------------
+ * Internal timer: reload sprite whenever DeviceSettings.activeSprite changes.
+ * -------------------------------------------------------------------------*/
+static void sprite_refresh_handler(lv_timer_t* /*t*/) {
+    static String last_sprite;
+    const String& active = DeviceSettings::getInstance().activeSprite;
+    if (active != last_sprite) {
+        last_sprite = active;
+        lcd_show_sprite(active);
+    }
+}
+
 void LcdThread::run() {
     // Setup LedC
     ledcSetup(0, 5000, 12); // 4096 steps @ 5Khz
@@ -240,6 +279,8 @@ void LcdThread::run() {
     lv_timer_t * animtimer = lv_timer_create(idle_anim_handler, 1500, NULL); // 0.5Hz
     lv_timer_t * postimer = lv_timer_create(counter_handler, 33, NULL); // ~30Hz
     lv_timer_t * lcd_cmd_timer = lv_timer_create(lcd_manager, 1000, NULL); // 1Hz
+    // Poll DeviceSettings.activeSprite for changes and update the sprite widget.
+    lv_timer_t * sprite_timer = lv_timer_create(sprite_refresh_handler, 500, NULL); // 2Hz
 
     /* 
         Start Timers
@@ -248,6 +289,7 @@ void LcdThread::run() {
     lv_timer_ready(animtimer);
     lv_timer_ready(postimer);
     lv_timer_ready(lcd_cmd_timer);
+    lv_timer_ready(sprite_timer);
 
 
     ui_init(); // Initialize UI

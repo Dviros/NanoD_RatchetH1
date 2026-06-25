@@ -130,12 +130,12 @@ void HapticInterface::correct_pid(void)
     
 
     uint16_t total_positions = haptic_state.detent_profile.end_pos - haptic_state.detent_profile.start_pos + 1;
-    // If the error is large, clamp the D term so we don't overdrive the response.
-    haptic_pid->D = total_positions > 0 ? 0 : CLAMP(
+    // FIX: condition was inverted — apply D only when detents exist, zero it when there are none.
+    haptic_pid->D = total_positions > 0 ? CLAMP(
         raw,
         min(d_lower_strength, d_upper_strength),
         max(d_lower_strength, d_upper_strength)
-    );
+    ) : 0;
 
     // Check if within range and apply voltage/current limit.
     if (haptic_state.attract_angle <= haptic_state.last_attract_angle - haptic_state.detent_width)
@@ -349,9 +349,11 @@ void HapticInterface::haptic_target(void)
     if(!haptic_state.atLimit && haptic_state.wasAtLimit){
         bounds_handler(haptic_state.detent_width);
     }
-    else
+    else {
+        // FIX: braces added — move() must only run on the normal (non-bounds) path
         motor->loopFOC();
         motor->move(default_pid(error));
+    }
 }
 
 /**

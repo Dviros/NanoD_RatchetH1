@@ -8,6 +8,7 @@
 #include "./led_api.h"
 #include "./hmi_api.h"
 #include "./DeviceSettings.h"
+#include "./semaphore_guard.h"
 
 using namespace ace_button;
 
@@ -110,6 +111,10 @@ class HmiThread : public Thread<HmiThread> {
         bool gReverseDirection = false;
         int brightness = 0;
         int fadeAmount = 10;
+
+        // Mutex protecting haptic_state and other cross-thread HMI state.
+        // Created in run() before any other thread can touch shared fields.
+        SemaphoreHandle_t _hmi_mutex = nullptr;
 
 };
 

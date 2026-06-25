@@ -43,8 +43,13 @@ void FocThread::run() {
     spi->begin(PIN_MAG_CLK, PIN_MAG_DO, -1, PIN_MAG_CS);
     encoder.init(spi);
 
-    driver.voltage_power_supply = 5.0f; // TODO global settings
-    driver.voltage_limit = 5.0f;
+    // FIX: use negotiated PD voltage from DeviceSettings; clamp to board-safe [5.0, 9.0] V.
+    {
+        float pdV = DeviceSettings::getInstance().pdVoltage;
+        if (pdV < 5.0f || pdV > 9.0f) pdV = 5.0f; // default/safe fallback
+        driver.voltage_power_supply = pdV;
+        driver.voltage_limit = pdV; // limit cannot exceed supply
+    }
 
     driver.init();
     motor.linkSensor(&encoder);
@@ -71,7 +76,10 @@ void FocThread::run() {
     // unsigned long ts = micros();
     uint16_t serial_last_pos = 0;
     while (true) {
-        haptic.haptic_loop();
+        // Drive non-blocking recalibration; skip haptic output while in progress.
+        if (!commander.tickRecalibration()) {
+            haptic.haptic_loop();
+        }
         float ang = encoder.getAngle();
         unsigned long now = micros();
         // if (fabs(ang - lastang) >= angleEventMinAngle && now - ts >= angleEventMinMicroseconds) {
@@ -140,6 +148,10 @@ bool FocThread::pass_at_limit(){
 
 float FocThread::get_motor_angle() {
     return motor.shaft_angle;
+};
+
+float FocThread::get_motor_velocity() {
+    return motor.shaft_velocity;
 };
 
 void FocThread::handleMessage() {

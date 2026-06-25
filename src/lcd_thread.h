@@ -7,6 +7,10 @@
 #include "thread_crtp.h"
 #include "ui.h"
 
+// Forward declaration — full definition in sprite_store.h
+// Call lcd_show_sprite() from any thread that holds the LVGL mutex (lcd task context).
+void lcd_show_sprite(const String& name);
+
 
 
 typedef enum {

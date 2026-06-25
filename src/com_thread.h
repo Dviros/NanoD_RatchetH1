@@ -6,6 +6,7 @@
 #include <MIDI.h>
 #include <ArduinoJSON.h>
 #include "HapticProfileManager.h"
+#include <atomic>      // FW3: global_sleep_flag must be std::atomic<bool>
 
 
 enum StringMessageType {
@@ -35,8 +36,9 @@ class ComThread : public Thread<ComThread> {
         void setCurrentProfile(String name);
         void put_string_message(const StringMessage& msg);
         bool isProfileNameOk(String& name);
-        
-        bool global_sleep_flag = false;
+
+        // FW3: std::atomic so HMI/LCD threads can read safely without a mutex
+        std::atomic<bool> global_sleep_flag{false};
         unsigned long ts_last_activity;
         uint32_t global_idle_timeout = 5000;
 
@@ -61,6 +63,9 @@ class ComThread : public Thread<ComThread> {
         void sendError(String& error, String& msg);
         void sendError(const char* error, String& msg);
         void sendError(const char* error, const char* msg = nullptr);
+
+        // FW3: emit {"ack":"<cmd>","ok":true/false,"error":"..."} for every mutating command
+        void sendAck(const char* cmd, bool ok, const char* errMsg = nullptr);
 
         QueueHandle_t _q_strings_in;
 };

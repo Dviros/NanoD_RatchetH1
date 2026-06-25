@@ -3,20 +3,20 @@
 
 HapticCommander::HapticCommander(BLDCMotor* motor) : motor(motor) {};
 
-void HapticCommander::handleMessage(String* message) {    
+void HapticCommander::handleMessage(String* message) {
     msg_in = (char*)message->c_str();
     uint8_t reg = atoi(msg_in);
     msg_in = strchr(msg_in, '=');
     if (msg_in != NULL) {
         if (reg==REG_RECALIBRATE) {
             uint8_t value; *this >> value;
-            if (value==1) {
+            if (value==1 && _recalState == RecalState::IDLE) {
+                // FIX: removed blocking vTaskDelay(1000ms) from FOC real-time path.
+                // Transition to the non-blocking state machine instead.
+                // tickRecalibration() (called from foc_thread loop) drives the rest.
                 motor->disable();
-                vTaskDelay(1000 / portTICK_PERIOD_MS);
-                motor->sensor_direction = Direction::UNKNOWN;
-                motor->zero_electric_angle = NOT_SET;
-                motor->enable();
-                motor->initFOC();
+                _recalTickStart = xTaskGetTickCount();
+                _recalState = RecalState::DISABLING;
             }
         }
         else
@@ -25,6 +25,34 @@ void HapticCommander::handleMessage(String* message) {
     msg_out = message;
     sendRegister(reg);
     msg_in = NULL;
+};
+
+
+bool HapticCommander::tickRecalibration() {
+    switch (_recalState) {
+        case RecalState::IDLE:
+            return false;
+
+        case RecalState::DISABLING:
+            // Wait for the settle period without blocking.
+            if ((xTaskGetTickCount() - _recalTickStart) >= RECAL_SETTLE_TICKS) {
+                // Settle done — clear calibration and re-init.
+                motor->sensor_direction = Direction::UNKNOWN;
+                motor->zero_electric_angle = NOT_SET;
+                _recalState = RecalState::REINIT;
+            }
+            return true; // still in progress
+
+        case RecalState::REINIT:
+            motor->enable();
+            motor->initFOC();
+            _recalState = RecalState::IDLE;
+            return false; // done
+
+        default:
+            _recalState = RecalState::IDLE;
+            return false;
+    }
 };
 
 

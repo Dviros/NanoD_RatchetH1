@@ -24,6 +24,7 @@ class FocThread : public Thread<FocThread> {
     
 
         float get_motor_angle();
+        float get_motor_velocity();
         
         uint16_t pass_actual_pos();
         uint16_t pass_cur_pos();

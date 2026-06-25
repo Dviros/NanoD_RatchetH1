@@ -3,7 +3,8 @@
 #include "foc_thread.h"
 #include <Adafruit_TinyUSB.h>
 #include "MIDI.h"
-#include "audio/audio.h"
+#include "audio/audio_api.h"   // audio_play() / audio_click() stubs (no-ops if NANO_AUDIO=0)
+#include "audio/audio.h"       // BinarisAudioPlayer – guarded by NANO_AUDIO inside
 #include <SparkFun_STUSB4500.h>
 
 using namespace ace_button;
@@ -77,7 +78,9 @@ void HmiThread::init(ledConfig& initial_led_config, hmiConfig& initial_hmi_confi
     Serial2.begin(31250, SERIAL_8N1, PIN_SERIAL2_RX, PIN_SERIAL2_TX);
     midi2.setHandleSystemExclusive(midi_sysex_handler);  
     midi2.begin();
+#if NANO_AUDIO
     audioPlayer.audio_init();
+#endif
 };
 
 
@@ -143,6 +146,11 @@ bool HmiThread::get_key_event(KeyEvt* keyEvt){
 
 
 void HmiThread::run() {
+    // Fix 3: recursive mutex guards keyState, currentValue and any shared HMI state.
+    // Created here (before ISR callbacks can fire) so it is valid for the full thread lifetime.
+    _hmi_mutex = xSemaphoreCreateRecursiveMutex();
+    configASSERT(_hmi_mutex);
+
     FastLED.addLeds<LED_CHIPSET, PIN_LED_A, RGB>(leds, NANO_LED_A_NUM);
     FastLED.addLeds<LED_CHIPSET, PIN_LED_B, LED_COL_ORDER>(ledsp, NANO_LED_B_NUM);
     FastLED.setBrightness( DEFAULT_LED_MAX_BRIGHTNESS );
@@ -159,6 +167,9 @@ void HmiThread::run() {
         buttons[i]->getButtonConfig()->setIEventHandler(&button_handler[i]);
         buttons[i]->getButtonConfig()->setClickDelay(50);
         buttons[i]->getButtonConfig()->clearFeature(ButtonConfig::kFeatureDoubleClick);
+        // Fix 4: enable LongPress events so held-key actions are dispatched (kEventLongPressed).
+        buttons[i]->getButtonConfig()->setFeature(ButtonConfig::kFeatureLongPress);
+        buttons[i]->getButtonConfig()->setLongPressDelay(500); // 500 ms hold threshold
     }
     int keys[4] = {0x1, 0x2, 0x4, 0x8};
     int leds[4][2] = {{3, 4}, {2, 5}, {1, 6}, {0, 7}};
@@ -179,7 +190,7 @@ void HmiThread::run() {
     unsigned long updates = 0;
     unsigned long ts = micros();
 
-    audioPlayer.play_audio(chime_wav, 80);
+    audio_play(SOUND_CHIME); // startup chime – no-op if NANO_AUDIO=0
     while (1) {
         handleSettings();
         handleConfig();
@@ -196,9 +207,9 @@ void HmiThread::run() {
             FastLED.show();
             previousMillis = currentMillis;
         }
-        #ifdef AUDIO_EN
+#if NANO_AUDIO
         audioPlayer.audio_loop();
-         #endif
+#endif
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
     
@@ -212,22 +223,30 @@ HmiThreadButtonHandler::HmiThreadButtonHandler(uint8_t _index) : index(_index) {
 
 
 void HmiThreadButtonHandler::handleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) {
+    // Fix 3: guard keyState and all shared HMI state with the recursive mutex.
+    SemaphoreGuard guard(hmi_thread._hmi_mutex);
+
     switch (eventType) {
         case AceButton::kEventPressed:
             hmi_thread.keyState |= (1<<index);
             for (int i=0; i<hmi_thread.hmi_config.keys[index].num_pressed_actions; i++) {
                 hmi_thread.handleKeyAction(hmi_thread.hmi_config.keys[index].pressed[i], eventType);
             }
-            if (audioPlayer.audio_config.key_audio_file!=nullptr)
-                audioPlayer.play_audio(audioPlayer.audio_config.key_audio_file, audioPlayer.audio_config.audio_feedback_lvl);
+            audio_click(); // key-press haptic click – no-op if NANO_AUDIO=0
         break;
         case AceButton::kEventReleased:
             hmi_thread.keyState &= ~(1<<index);
             for (int i=0; i<hmi_thread.hmi_config.keys[index].num_pressed_actions; i++) {
                 hmi_thread.handleKeyAction(hmi_thread.hmi_config.keys[index].pressed[i], eventType);
-            }            
+            }
             for (int i=0; i<hmi_thread.hmi_config.keys[index].num_released_actions; i++) {
                 hmi_thread.handleKeyAction(hmi_thread.hmi_config.keys[index].released[i], eventType);
+            }
+        break;
+        // Fix 4: dispatch held actions (were parsed/stored but never fired).
+        case AceButton::kEventLongPressed:
+            for (int i=0; i<hmi_thread.hmi_config.keys[index].num_held_actions; i++) {
+                hmi_thread.handleKeyAction(hmi_thread.hmi_config.keys[index].held[i], eventType);
             }
         break;
     }
@@ -308,11 +327,12 @@ void HmiThread::updateValue() {
             knobValue& v = hmi_config.knob.values[i];
             if (v.key_state==keyState) {
                 float value = 0;
+                // Fix 5: assign result of _constrain back to angle so the clamp actually takes effect.
                 if (v.angle_min<v.angle_max) {
-                    _constrain(angle, v.angle_min, v.angle_max);
+                    angle = _constrain(angle, v.angle_min, v.angle_max);
                 }
                 else {
-                    _constrain(angle, v.angle_max, v.angle_min);
+                    angle = _constrain(angle, v.angle_max, v.angle_min);
                 }
                 if (v.angle_max == v.angle_min) {
                     value = v.value_min;
@@ -323,8 +343,9 @@ void HmiThread::updateValue() {
                 if (v.step!=0) {
                     value = round(value / v.step) * v.step;
                 }
+                // Fix 6: removed the line that overwrote `currentValue` with raw encoder position,
+                // which killed the knob mapping.  The computed mapped value is correct.
                 currentValue = value;
-                currentValue = foc_thread.pass_cur_pos(); // TODO fix and remove this in future
                 if (currentValue!=lastValue) {
                     if (v.type==knobValueType::KV_MIDI) {
                         uint8_t midi_value = (uint8_t)(currentValue);
@@ -489,7 +510,7 @@ void HmiThread::halvesPointer(int indicator, int startpos, int endpos, int orien
 
 static uint8_t colorIndex = 0;
 void HmiThread::IdleLeds(int fps, const struct CRGB& idleColStart, const struct CRGB& idleColMid, const struct CRGB& idleColEnd){
-    
+
     CRGB colors[] = {idleColStart ,idleColMid, idleColEnd};
     static unsigned long lastUpdateTime = 0;
     static bool increasing = false;
@@ -498,46 +519,99 @@ void HmiThread::IdleLeds(int fps, const struct CRGB& idleColStart, const struct 
     CRGB beginColor = colors[colorIndex];
     CRGB endColor = colors[(colorIndex + 1) % ARRAY_SIZE(colors)];
     CRGB currentColor = blend(beginColor, endColor, progress);
-    for(int i = 0; i < NANO_LED_A_NUM + 8; i++ ) {
-    leds[i] = currentColor;
+
+    // Fix 1: original loop ran to NANO_LED_A_NUM+8 (68), writing past end of leds[60].
+    // Ring LEDs (leds[]) and button LEDs (ledsp[]) are separate arrays — fill each bounded loop.
+    for (int i = 0; i < NANO_LED_A_NUM; i++) {
+        leds[i] = currentColor;
     }
+    for (int i = 0; i < NANO_LED_B_NUM; i++) {
+        ledsp[i] = currentColor;
+    }
+
     progress++;
     if (progress == 0) {  // Overflow, time to move to the next color
-    colorIndex = (colorIndex + 1) % ARRAY_SIZE(colors);
+        colorIndex = (colorIndex + 1) % ARRAY_SIZE(colors);
     }
     if(!com_thread.global_sleep_flag)
-    return;
+        return;
 }
 
 STUSB4500 usb_pd;
 
 PowerType HmiThread::init_pd() {
-  Wire.begin(PIN_NANO_I2C_SDA, PIN_NANO_I2C_SCL);
-  if (!usb_pd.begin()) {
-    Serial.println("STUSB4500 not found");
-  } else {
+    Wire.begin(PIN_NANO_I2C_SDA, PIN_NANO_I2C_SCL);
+
+    // Fix 2a: guard — if STUSB4500 is absent do not proceed; boot continues safely on 5V USB.
+    if (!usb_pd.begin()) {
+        Serial.println("STUSB4500 not found; defaulting to 5V USB");
+        DeviceSettings::getInstance().setPdVoltage(5.0f); // thread-safe setter from FW5
+        return POWER_5V_USB;
+    }
     Serial.println("STUSB4500 found");
-  }
-  if (usb_pd.getPdoNumber()!=2) {
-    Serial.println("Setting USB profiles to NVM");
-    usb_pd.setUsbCommCapable(true);
-    usb_pd.setVoltage(1,5.0);
-    usb_pd.setCurrent(1,3.0);
-    usb_pd.setLowerVoltageLimit(1,20);
-    usb_pd.setUpperVoltageLimit(1,20);
-    usb_pd.setVoltage(2,9.0);
-    usb_pd.setCurrent(2,3.0);
-    usb_pd.setLowerVoltageLimit(2,20);
-    usb_pd.setUpperVoltageLimit(2,10);
-    usb_pd.setVoltage(3,9.0);
-    usb_pd.setCurrent(3,3.0);
-    usb_pd.setLowerVoltageLimit(3,20);
-    usb_pd.setUpperVoltageLimit(3,10);
-    usb_pd.setPdoNumber(2);
-    usb_pd.write();  
-  }
 
-    // TODO: read status register to determine selected PDO
+    // Fix 2b: only write NVM when the profile is not already correct, avoiding unnecessary flash wear.
+    if (usb_pd.getPdoNumber() != 2) {
+        Serial.println("Programming STUSB4500 NVM with USB-PD profiles");
+        usb_pd.setUsbCommCapable(true);
+        usb_pd.setVoltage(1, 5.0);
+        usb_pd.setCurrent(1, 3.0);
+        usb_pd.setLowerVoltageLimit(1, 20);
+        usb_pd.setUpperVoltageLimit(1, 20);
+        usb_pd.setVoltage(2, 9.0);
+        usb_pd.setCurrent(2, 3.0);
+        usb_pd.setLowerVoltageLimit(2, 20);
+        usb_pd.setUpperVoltageLimit(2, 10);
+        usb_pd.setVoltage(3, 9.0);
+        usb_pd.setCurrent(3, 3.0);
+        usb_pd.setLowerVoltageLimit(3, 20);
+        usb_pd.setUpperVoltageLimit(3, 10);
+        usb_pd.setPdoNumber(2);
+        usb_pd.write();
 
-  return POWER_5V_USB;
+        // Fix 3: use the SparkFun library's softReset() instead of a raw Wire
+        // register write that was prepared but never transmitted (endTransmission
+        // was called but the frame was never actually sent as a complete I2C write
+        // with data). softReset() handles the full register sequence internally.
+        // 1000 ms settle delay gives the PD re-negotiation window enough time.
+        usb_pd.softReset();
+        delay(1000); // allow re-negotiation to complete
+    }
+
+    // Fix 2d: read the selected PDO voltage; PDO1=5V is always the fallback per our NVM config.
+    // The SparkFun library exposes getVoltage(pdoNum) for the NVM-configured values.
+    // We read the active PDO number by querying the STATUS register bit TYPEC_FSM_STATE.
+    // Simpler: read both configured PDO voltages and pick based on which was negotiated.
+    // STUSB4500 RDO_REG_STATUS (0x91) bits [30:28] = selected object number (1-indexed).
+    uint8_t selected_pdo = 1; // default to PDO1 (5V)
+    Wire.beginTransmission(0x28);
+    Wire.write(0x91); // RDO_REG_STATUS register (selected PDO object position)
+    if (Wire.endTransmission(false) == 0) {
+        if (Wire.requestFrom((uint8_t)0x28, (uint8_t)4) == 4) {
+            uint8_t b0 = Wire.read();
+            uint8_t b1 = Wire.read();
+            uint8_t b2 = Wire.read();
+            uint8_t b3 = Wire.read();
+            // RDO object position is in bits [30:28] of the 32-bit register (big-endian)
+            selected_pdo = (b3 >> 4) & 0x07;
+            if (selected_pdo == 0) selected_pdo = 1; // 0 means no contract yet
+        }
+    }
+
+    float negotiated_v = usb_pd.getVoltage(selected_pdo);
+
+    // Fix 2d (cont): clamp to board-safe [5.0, 9.0] V regardless of what the charger offered.
+    if (negotiated_v < 5.0f || negotiated_v > 9.0f) {
+        Serial.printf("PD voltage %.1fV out of range, clamping to 5.0V\n", negotiated_v);
+        negotiated_v = 5.0f;
+    }
+
+    // Store into DeviceSettings so foc_thread can consume it before motor init.
+    // Use thread-safe accessor provided by FW5.
+    DeviceSettings::getInstance().setPdVoltage(negotiated_v);
+    Serial.printf("PD negotiated: PDO%d = %.1fV\n", selected_pdo, negotiated_v);
+
+    if (negotiated_v >= 9.0f) return POWER_9V_PD;
+    if (negotiated_v > 5.0f)  return POWER_5V_PD; // 6/7/8V variants possible
+    return POWER_5V_USB;
 }

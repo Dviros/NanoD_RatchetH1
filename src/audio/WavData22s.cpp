@@ -1,6 +1,6 @@
 
 
-#if defined(AUDIO_FILES_STEREO) && !defined(USE_AUDIO_LIB)
+#if NANO_AUDIO && defined(AUDIO_FILES_STEREO) && !defined(USE_AUDIO_LIB)
 
 #include <inttypes.h>
 

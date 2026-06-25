@@ -193,4 +193,15 @@ lv_obj_set_style_text_opa(ui_IdleCatShadow, 255, LV_PART_MAIN| LV_STATE_DEFAULT)
 lv_obj_set_style_text_font(ui_IdleCatShadow, &ui_font_IdleCat, LV_PART_MAIN| LV_STATE_DEFAULT);
 lv_obj_add_flag( ui_IdleCatShadow, LV_OBJ_FLAG_HIDDEN );   // Hide Default
 
+/* --- Sprite image widget (FW7 additive) ---
+   Centered, hidden by default. lcd_show_sprite() provides the image source path
+   via lv_img_set_src() and removes HIDDEN.  Rendered above the arc ring but
+   below the idle overlay so the cat still covers it during sleep. */
+ui_spriteImg = lv_img_create(ui_valueScreen);
+lv_obj_set_align(ui_spriteImg, LV_ALIGN_CENTER);
+lv_obj_add_flag(ui_spriteImg, LV_OBJ_FLAG_HIDDEN);  // hidden until a sprite is loaded
+lv_obj_clear_flag(ui_spriteImg,
+    LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_PRESS_LOCK |
+    LV_OBJ_FLAG_CLICK_FOCUSABLE | LV_OBJ_FLAG_SCROLLABLE);
+
 }

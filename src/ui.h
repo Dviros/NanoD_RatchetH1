@@ -42,7 +42,9 @@ extern lv_obj_t *ui_msgModal2;
 extern lv_obj_t *ui_msgTitle2;
 extern lv_obj_t *ui_msgDesc2;
 extern lv_obj_t *ui_IdleCat;
-extern lv_obj_t *ui_IdleCatShadow; 
+extern lv_obj_t *ui_IdleCatShadow;
+/* Sprite image widget — populated by lcd_show_sprite() after ui_init() */
+extern lv_obj_t *ui_spriteImg;
 
 // SCREEN: ui_profSelectScreen
 void ui_profSelectScreen_screen_init(void);

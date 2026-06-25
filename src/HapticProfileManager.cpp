@@ -1,7 +1,7 @@
 
 #include "./HapticProfileManager.h"
 #include "./DeviceSettings.h"
-#include "SPIFFS.h"
+#include <LittleFS.h>
 #include "audio/audio_api.h"
 
 #include "class/hid/hid.h"
@@ -166,10 +166,10 @@ String HapticProfileManager::getPrevProfileName(){
 
 
 void HapticProfileManager::fromSPIFFS() {
-  Serial.println("Loading profiles from SPIFFS...");
+  Serial.println("Loading profiles from LittleFS...");
   // load profiles from SPIFFS
   int count = 0;
-  File dir = SPIFFS.open(PROFILES_DIRECTORY, "r");
+  File dir = LittleFS.open(PROFILES_DIRECTORY, "r");
   if (dir) {
     File file = dir.openNextFile();
     while (file) {
@@ -263,15 +263,15 @@ void HapticProfileManager::fromSPIFFS() {
 
 
 void HapticProfileManager::toSPIFFS() {
-  Serial.println("Saving profiles to SPIFFS...");
-  File dir = SPIFFS.open(PROFILES_DIRECTORY, "r");
+  Serial.println("Saving profiles to LittleFS...");
+  File dir = LittleFS.open(PROFILES_DIRECTORY, "r");
   if (!dir) {
     Serial.println("Creating profiles directory...");
-    if (!SPIFFS.mkdir(PROFILES_DIRECTORY)){
+    if (!LittleFS.mkdir(PROFILES_DIRECTORY)){
       Serial.println("ERROR: Failed to create profiles directory.");
       return;
     }
-    dir = SPIFFS.open(PROFILES_DIRECTORY, "r");
+    dir = LittleFS.open(PROFILES_DIRECTORY, "r");
     if (!dir) {
       Serial.println("ERROR: Failed to open profiles directory.");
       return;
@@ -291,14 +291,16 @@ void HapticProfileManager::toSPIFFS() {
           }
         }
       }
-      file.close();
+      file.close();  // close .json handle before potential remove
       if (!found) {
         String remove = PROFILES_DIRECTORY;
         remove += "/" + filename;
         Serial.print("Removing deleted profile: ");
         Serial.println(remove);
-        SPIFFS.remove(remove);
+        LittleFS.remove(remove);
       }
+    } else {
+      file.close();  // fix: close non-.json / directory handle before reassigning (was leaking)
     }
     file = dir.openNextFile();
   }
@@ -311,7 +313,7 @@ void HapticProfileManager::toSPIFFS() {
       filename += "/";
       filename += profiles[i].profile_name;
       filename += ".json";
-      File file = SPIFFS.open(filename, "w");
+      File file = LittleFS.open(filename, "w");
       if (file) {
         JsonDocument doc;
         JsonObject obj = doc.to<JsonObject>();
@@ -467,7 +469,7 @@ HapticProfile& HapticProfile::operator=(JsonObject& obj) {
           else
             hmi_config.knob.values[i].actions.ccw.type = keyActionType::KA_NONE;
         }
-        else if (type="profiles") {
+        else if (type=="profiles") {  // fix: was assignment (=) not comparison (==), always entered this branch
           hmi_config.knob.values[i].type = knobValueType::KV_DEVICE_PROFILES;
           dirty = true;
           // TODO fields
@@ -545,7 +547,9 @@ void HapticProfile::keyActionFromJSON(JsonObject& obj, keyAction& action) {
       }
       dirty = true;
     }
-    else if (type=="profile" && obj["name"].is<String>()) {
+    else if ((type=="profile" || type=="profiles") && obj["name"].is<String>()) {
+      // "profiles" was the legacy (buggy) serialisation of KA_PROFILE_CHANGE — accept as alias
+      // and mark dirty so toSPIFFS rewrites it with the correct "profile" string
       action.type = keyActionType::KA_PROFILE_CHANGE;
       action.profile = obj["name"].as<String>();
       dirty = true;
@@ -712,7 +716,7 @@ void HapticProfile::keyActionToJSON(JsonObject& obj, keyAction& action){
       obj["buttons"] = action.pad.buttons;
       break;
     case keyActionType::KA_PROFILE_CHANGE:
-      obj["type"] = "profiles";
+      obj["type"] = "profile";  // fix: was "profiles" but parser (keyActionFromJSON) expects "profile"
       obj["name"] = action.profile;
       break;
     case keyActionType::KA_PROFILE_NEXT:

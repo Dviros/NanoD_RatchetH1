@@ -24,6 +24,8 @@ lv_obj_t *ui_msgTitle2;
 lv_obj_t *ui_msgDesc2;
 lv_obj_t *ui_IdleCat;
 lv_obj_t *ui_IdleCatShadow;
+/* Sprite image widget — created hidden; lcd_show_sprite() sets the image src and makes it visible */
+lv_obj_t *ui_spriteImg;
 
 
 
