@@ -24,10 +24,15 @@ void setup() {
   // initialize USB
   TinyUSBDevice.begin();
   hmi_thread.init_usb();
-  TinyUSBDevice.setID(0x239A, 0x8010); // TODO move to #define
-  TinyUSBDevice.setProductDescriptor("Nano_D++ (Beta)"); // TODO move to #define
-  TinyUSBDevice.setManufacturerDescriptor("Binaris Circuitry");
-  TinyUSBDevice.setSerialDescriptor("Nano_D");
+  TinyUSBDevice.setID(USB_VID, USB_PID);
+  TinyUSBDevice.setProductDescriptor(USB_PRODUCT);
+  TinyUSBDevice.setManufacturerDescriptor(USB_MANUFACTURER);
+  // Per-device USB serial = eFuse MAC (read directly; DeviceSettings isn't up yet).
+  // A unique serial lets macOS/Windows assign stable, distinct ports per unit and
+  // lets the app tell two knobs apart. (Was the constant "Nano_D".)
+  static char usb_serial[13];
+  snprintf(usb_serial, sizeof(usb_serial), "%012llX", (unsigned long long)ESP.getEfuseMac());
+  TinyUSBDevice.setSerialDescriptor(usb_serial);
   //TinyUSBDevice.attach();
   Serial.begin(DEFAULT_SERIAL_SPEED);
 

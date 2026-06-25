@@ -346,6 +346,7 @@ static lv_fs_drv_t s_lvfs_drv;
 namespace SpriteStore {
 
 void begin() {
+    // Filesystem ONLY. Safe to call from setup() before lv_init(). Must NOT touch LVGL.
     if (!LittleFS.begin(true)) {
         Serial.println("[SpriteStore] LittleFS mount failed");
         return;
@@ -353,8 +354,13 @@ void begin() {
     if (!LittleFS.exists(SPRITE_DIR)) {
         LittleFS.mkdir(SPRITE_DIR);
     }
+    Serial.println("[SpriteStore] storage ready");
+}
 
-    // Register the LVGL filesystem driver on letter 'L'.
+// MUST be called AFTER lv_init() (from LcdThread::run), never from setup().
+// lv_fs_drv_register() allocates via the LVGL heap; before lv_init() the TLSF
+// state is NULL and lv_malloc dereferences it -> hard fault / boot crash loop.
+void registerLvglDriver() {
     lv_fs_drv_init(&s_lvfs_drv);
     s_lvfs_drv.letter   = 'L';
     s_lvfs_drv.open_cb  = lvfs_open;
@@ -364,8 +370,7 @@ void begin() {
     s_lvfs_drv.tell_cb  = lvfs_tell;
     // write_cb left null — read-only driver sufficient for image display
     lv_fs_drv_register(&s_lvfs_drv);
-
-    Serial.println("[SpriteStore] ready");
+    Serial.println("[SpriteStore] LVGL 'L:' driver registered");
 }
 
 bool handleCommand(JsonObjectConst cmd, String& err) {

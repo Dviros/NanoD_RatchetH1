@@ -25,11 +25,16 @@ namespace SpriteStore {
     /* --- Lifecycle -------------------------------------------------------- */
 
     /**
-     * Mount LittleFS (if not already mounted), create /sprites directory,
-     * and register the LVGL 'L' filesystem driver.
-     * Call once from main before any thread starts.
+     * Mount LittleFS (if not already mounted) and create /sprites directory.
+     * Filesystem only — safe to call from setup() before lv_init().
      */
     void begin();
+
+    /**
+     * Register the LVGL 'L:' filesystem driver. MUST be called AFTER lv_init()
+     * (from LcdThread::run), never from setup() — it allocates via the LVGL heap.
+     */
+    void registerLvglDriver();
 
     /* --- Command dispatcher ----------------------------------------------- */
 

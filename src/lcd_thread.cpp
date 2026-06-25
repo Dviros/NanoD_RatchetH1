@@ -264,6 +264,9 @@ void LcdThread::run() {
     ledcSetup(0, 5000, 12); // 4096 steps @ 5Khz
     ledcAttachPin(5, 0); // LEDC on Pin 5
     lv_init(); // Initialize LVGL
+    // Register the sprite 'L:' filesystem driver now that the LVGL heap exists.
+    // (Must NOT happen in setup()/SpriteStore::begin() — would crash before lv_init.)
+    SpriteStore::registerLvglDriver();
 
     /*
         Create Display Object
