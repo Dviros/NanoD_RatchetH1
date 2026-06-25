@@ -17,6 +17,9 @@ static constexpr size_t LV_PSRAM_POOL_SIZE = 256 * 1024U;
 
 // GIF widget — only one active at a time; recreated when sprite changes.
 static lv_obj_t* s_gif_obj = nullptr;
+// Full-screen opaque layer that hosts the active sprite ON TOP of everything,
+// so a sprite REPLACES the dial view instead of overlaying it. Null = dial shown.
+static lv_obj_t* s_sprite_layer = nullptr;
 
 
 // TODO: Move to PIO Build Flags
@@ -244,48 +247,50 @@ static void counter_handler(lv_timer_t * postimer) {
  * 'L' is the LittleFS LVGL driver letter registered by SpriteStore::begin().
  * -------------------------------------------------------------------------*/
 void lcd_show_sprite(const String& name) {
-    // --- tear down previous GIF widget if any ---
-    if (s_gif_obj) {
-        lv_obj_del(s_gif_obj);
-        s_gif_obj = nullptr;
+    // --- tear down the previous full-screen sprite layer (and its GIF) ---
+    if (s_sprite_layer) {
+        lv_obj_del(s_sprite_layer);   // deletes children (GIF/img) too
+        s_sprite_layer = nullptr;
+        s_gif_obj      = nullptr;
     }
+    // Hide the legacy in-screen sprite widget — we no longer draw onto the dial.
+    if (ui_spriteImg) lv_obj_add_flag(ui_spriteImg, LV_OBJ_FLAG_HIDDEN);
 
-    if (!ui_spriteImg) return; // ui not yet initialised
+    // Empty / missing sprite -> nothing on top -> the dial view is shown.
+    if (name.length() == 0 || !SpriteStore::exists(name)) return;
 
-    if (name.length() == 0 || !SpriteStore::exists(name)) {
-        lv_obj_add_flag(ui_spriteImg, LV_OBJ_FLAG_HIDDEN);
-        return;
-    }
-
-    // Build the LVGL fs path: "L:/sprites/<name>"
     String lvPath = "L:" + SpriteStore::pathFor(name);
-
-    // Detect GIF by file extension (case-insensitive suffix check)
     bool is_gif = name.length() >= 4 &&
                   name.substring(name.length() - 4).equalsIgnoreCase(".gif");
 
+    // Full-screen opaque black layer on lv_layer_top() — sits ABOVE every screen,
+    // so the sprite fully replaces the dial instead of overlaying it. A smaller
+    // sprite is centred on black; a 240x240 sprite fills the round display.
+    s_sprite_layer = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_sprite_layer);
+    lv_obj_set_size(s_sprite_layer, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(s_sprite_layer, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_sprite_layer, LV_OPA_COVER, 0);
+    lv_obj_center(s_sprite_layer);
+    lv_obj_clear_flag(s_sprite_layer, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+
     if (is_gif) {
 #if LV_USE_GIF
-        // Hide the static image widget while GIF is active.
-        lv_obj_add_flag(ui_spriteImg, LV_OBJ_FLAG_HIDDEN);
-
-        // Create GIF widget centred on the value screen.
-        // Parent: ui_valueScreen so it sits above the arc ring but below idle overlay.
-        s_gif_obj = lv_gif_create(ui_valueScreen);
+        s_gif_obj = lv_gif_create(s_sprite_layer);
         if (s_gif_obj) {
             lv_gif_set_src(s_gif_obj, lvPath.c_str());
-            lv_obj_set_align(s_gif_obj, LV_ALIGN_CENTER);
-            // Prevent scroll / click passthrough
-            lv_obj_clear_flag(s_gif_obj,
-                LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_PRESS_LOCK |
-                LV_OBJ_FLAG_CLICK_FOCUSABLE | LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_center(s_gif_obj);
+            lv_obj_clear_flag(s_gif_obj, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+        } else {
+            // PSRAM OOM — drop the layer so we fall back to the dial rather than a black screen.
+            lv_obj_del(s_sprite_layer);
+            s_sprite_layer = nullptr;
         }
-        // Fallback: if lv_gif_create fails (e.g. PSRAM OOM), show nothing rather than crash.
 #endif
     } else {
-        // Static image path — lv_img_set_src accepts a C-string FS path.
-        lv_img_set_src(ui_spriteImg, lvPath.c_str());
-        lv_obj_remove_flag(ui_spriteImg, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_t* img = lv_img_create(s_sprite_layer);
+        lv_img_set_src(img, lvPath.c_str());
+        lv_obj_center(img);
     }
 }
 
