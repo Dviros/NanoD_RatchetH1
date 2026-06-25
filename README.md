@@ -198,12 +198,26 @@ Both OTA app slots are 0x140000 (1.3 MB). The `spiffs` partition label is retain
 
 ---
 
+## Testing
+
+See **[docs/TESTING.md](docs/TESTING.md)** for the full test strategy.
+
+Short version — three layers, run in order:
+
+1. **Native unit tests** (no hardware): `pio test -e native` — covers CRC-32 parity, PD clamp, value mapping, profile-type symmetry, and settings integrity. Runs on any laptop in under 5 s. Run this after every code change.
+2. **Protocol E2E harness** (`fw/test/integration/nanod_e2e.mjs`) — connects to a flashed device over TCP:3333 (WiFi build) or USB serial and verifies ACKs, settings round-trip, and sprite upload CRC. No manual steps.
+3. **Hardware checklist** ([docs/HARDWARE_TEST_CHECKLIST.md](docs/HARDWARE_TEST_CHECKLIST.md)) — ordered by risk. The device is not field-ready until PD voltage (§ 3) and OTA rollback (§ 8.5) are both signed off.
+
+---
+
 ## Further reading
 
 - [communications.md](communications.md) — full serial JSON protocol
 - [hid.md](hid.md) — USB HID report descriptors
 - [midi.md](midi.md) — MIDI protocol details
 - [mapping.md](mapping.md) — knob/key mapping reference
+- docs/TESTING.md — test strategy (native → protocol harness → hardware)
 - docs/BRICK_PROOFING.md — recovery procedures
 - docs/HARDWARE_TEST_CHECKLIST.md — bring-up test checklist
+- docs/KNOWN_RESIDUALS.md — items compile-verified but not yet validated on hardware
 - [CHANGELOG.md](CHANGELOG.md) — release history

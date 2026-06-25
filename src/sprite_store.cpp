@@ -18,6 +18,7 @@
 
 #include "sprite_store.h"
 #include "DeviceSettings.h"
+#include "crc32_util.h"   // nano_crc32_update — shared with native test suite
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
@@ -49,16 +50,10 @@ struct UploadCtx {
 
 UploadCtx g_upload;
 
-// Simple CRC-32 (IEEE 802.3 poly, no table — small flash footprint).
-// For a 64 KB sprite this is fast enough in the com_thread context.
-static uint32_t crc32_update(uint32_t crc, const uint8_t* buf, size_t len) {
-    crc = ~crc;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= buf[i];
-        for (int b = 0; b < 8; b++)
-            crc = (crc >> 1) ^ (0xEDB88320u & -(crc & 1));
-    }
-    return ~crc;
+// CRC-32 is now provided by include/crc32_util.h (nano_crc32_update).
+// The alias keeps the call-sites below unchanged.
+static inline uint32_t crc32_update(uint32_t crc, const uint8_t* buf, size_t len) {
+    return nano_crc32_update(crc, buf, len);
 }
 
 // ---------------------------------------------------------------------------
