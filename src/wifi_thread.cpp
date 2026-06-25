@@ -34,7 +34,9 @@ WifiThread wifi_thread;
     while (true) {
         self->loop();
         esp_task_wdt_reset(); // feed watchdog each iteration
-        vTaskDelay(pdMS_TO_TICKS(10));
+        // 2ms tick: keeps round-trip latency low (read client + drain out-queue
+        // promptly). Low-priority task on core 0, so the extra wakeups are cheap.
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
 
@@ -116,6 +118,7 @@ void WifiThread::loop() {
             for (auto& slot : _slots) {
                 if (!slot.client.connected()) {
                     slot.client    = incoming;
+                    slot.client.setNoDelay(true); // disable Nagle — send small JSON frames immediately (low latency)
                     slot.buf       = "";
                     slot.authState = ClientSlot::AuthState::WAIT_HELLO_SENT;
                     slot.deviceNonceHex = "";

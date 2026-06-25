@@ -28,8 +28,9 @@
 // ---------------------------------------------------------------------------
 // Tunables
 // ---------------------------------------------------------------------------
-static constexpr size_t  MAX_SPRITE_SIZE   = 64  * 1024;  // 64 KB per sprite
-static constexpr size_t  MAX_SPRITES_BYTES = 512 * 1024;  // 512 KB total
+static constexpr size_t  MAX_SPRITE_SIZE   = 64  * 1024;  // 64 KB per static sprite (bmp/png)
+static constexpr size_t  MAX_GIF_SIZE      = 200 * 1024;  // 200 KB per GIF sprite
+static constexpr size_t  MAX_SPRITES_BYTES = 768 * 1024;  // 768 KB total (raised from 512 KB for GIF)
 static constexpr uint8_t MAX_SPRITES       = 16;
 static const char*       SPRITE_DIR        = "/sprites";
 
@@ -150,6 +151,17 @@ static int b64_decode(const char* src, size_t src_len, uint8_t* dst, size_t dst_
 // Sub-command handlers
 // ---------------------------------------------------------------------------
 
+// Returns true if the filename ends with ".gif" (case-insensitive).
+static bool is_gif_name(const char* name) {
+    size_t n = strlen(name);
+    if (n < 4) return false;
+    const char* ext = name + n - 4;
+    return (ext[0] == '.' &&
+            (ext[1] == 'g' || ext[1] == 'G') &&
+            (ext[2] == 'i' || ext[2] == 'I') &&
+            (ext[3] == 'f' || ext[3] == 'F'));
+}
+
 static bool handle_begin(JsonObjectConst cmd, String& err) {
     // Abort any prior stale upload.
     abort_upload();
@@ -160,7 +172,10 @@ static bool handle_begin(JsonObjectConst cmd, String& err) {
     if (!name || strlen(name) == 0 || strlen(name) > 32) {
         err = "invalid name"; return false;
     }
-    if (size == 0 || size > MAX_SPRITE_SIZE) {
+
+    // Choose size limit based on file type: GIFs may be larger.
+    size_t effective_max = is_gif_name(name) ? MAX_GIF_SIZE : MAX_SPRITE_SIZE;
+    if (size == 0 || size > effective_max) {
         err = "invalid size"; return false;
     }
     // Reject if adding would overflow total budget.
@@ -212,7 +227,8 @@ static bool handle_data(JsonObjectConst cmd, String& err) {
         free(buf); abort_upload(); err = "base64 decode error"; return false;
     }
 
-    if (g_upload.written + (size_t)dec > MAX_SPRITE_SIZE) {
+    size_t upload_max = is_gif_name(g_upload.name.c_str()) ? MAX_GIF_SIZE : MAX_SPRITE_SIZE;
+    if (g_upload.written + (size_t)dec > upload_max) {
         free(buf); abort_upload(); err = "size overflow"; return false;
     }
 

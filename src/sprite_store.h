@@ -44,11 +44,13 @@ namespace SpriteStore {
      *
      * Recognised sub-commands (field "op"):
      *   "begin"  – { "op":"begin",  "name":"<n>", "size":<bytes> }
+     *              name may be *.bmp, *.png (max 64 KB) or *.gif (max 200 KB).
      *   "data"   – { "op":"data",   "seq":<int>,  "data":"<base64>" }
      *   "end"    – { "op":"end",    "crc32":<uint32> }
      *   "delete" – { "op":"delete", "name":"<n>" }
      *   "list"   – { "op":"list" }                  (returns names via err)
      *   "select" – { "op":"select", "name":"<n>" }  (sets DeviceSettings.activeSprite)
+     *              When name ends in ".gif", lcd_thread renders via lv_gif_create.
      */
     bool handleCommand(JsonObjectConst cmd, String& err);
 

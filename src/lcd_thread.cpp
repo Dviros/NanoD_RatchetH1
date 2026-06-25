@@ -7,6 +7,17 @@
 #include <TFT_eSPI.h>
 TFT_eSPI tft;
 
+// lv_mem_add_pool is declared in lvgl.h (included transitively), but include
+// the stdlib header explicitly to ensure it is available.
+#include <lvgl.h>
+
+// PSRAM pool size for LVGL GIF decode (240x240 RGB565 = 112 KB per frame,
+// allocate 256 KB to accommodate multi-frame GIF decode + overhead).
+static constexpr size_t LV_PSRAM_POOL_SIZE = 256 * 1024U;
+
+// GIF widget — only one active at a time; recreated when sprite changes.
+static lv_obj_t* s_gif_obj = nullptr;
+
 
 // TODO: Move to PIO Build Flags
 static const uint8_t LEDC_CH_LCD_BKL = 0; // LEDC Channel for LCD Backlight
@@ -226,11 +237,19 @@ static void counter_handler(lv_timer_t * postimer) {
  * lcd_show_sprite() — call ONLY from within the LVGL task (lcd_manager timer
  * or the LcdThread::run loop) so we don't need an external mutex.
  *
- * Sets the lv_img source to "L:<path>" where 'L' is the LittleFS LVGL
- * driver letter registered by SpriteStore::begin().  Hides the widget when
- * name is empty or the sprite doesn't exist.
+ * For static images (.bmp, .png): sets lv_img source to "L:<path>".
+ * For animated GIFs (.gif):       creates/replaces an lv_gif widget.
+ * Hides the widget when name is empty or the sprite doesn't exist.
+ *
+ * 'L' is the LittleFS LVGL driver letter registered by SpriteStore::begin().
  * -------------------------------------------------------------------------*/
 void lcd_show_sprite(const String& name) {
+    // --- tear down previous GIF widget if any ---
+    if (s_gif_obj) {
+        lv_obj_del(s_gif_obj);
+        s_gif_obj = nullptr;
+    }
+
     if (!ui_spriteImg) return; // ui not yet initialised
 
     if (name.length() == 0 || !SpriteStore::exists(name)) {
@@ -239,12 +258,35 @@ void lcd_show_sprite(const String& name) {
     }
 
     // Build the LVGL fs path: "L:/sprites/<name>"
-    // 'L' is the drive letter registered in SpriteStore::begin() for LittleFS.
     String lvPath = "L:" + SpriteStore::pathFor(name);
 
-    // lv_img_set_src accepts a C-string path when LV_USE_FS_* is enabled.
-    lv_img_set_src(ui_spriteImg, lvPath.c_str());
-    lv_obj_remove_flag(ui_spriteImg, LV_OBJ_FLAG_HIDDEN);
+    // Detect GIF by file extension (case-insensitive suffix check)
+    bool is_gif = name.length() >= 4 &&
+                  name.substring(name.length() - 4).equalsIgnoreCase(".gif");
+
+    if (is_gif) {
+#if LV_USE_GIF
+        // Hide the static image widget while GIF is active.
+        lv_obj_add_flag(ui_spriteImg, LV_OBJ_FLAG_HIDDEN);
+
+        // Create GIF widget centred on the value screen.
+        // Parent: ui_valueScreen so it sits above the arc ring but below idle overlay.
+        s_gif_obj = lv_gif_create(ui_valueScreen);
+        if (s_gif_obj) {
+            lv_gif_set_src(s_gif_obj, lvPath.c_str());
+            lv_obj_set_align(s_gif_obj, LV_ALIGN_CENTER);
+            // Prevent scroll / click passthrough
+            lv_obj_clear_flag(s_gif_obj,
+                LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_PRESS_LOCK |
+                LV_OBJ_FLAG_CLICK_FOCUSABLE | LV_OBJ_FLAG_SCROLLABLE);
+        }
+        // Fallback: if lv_gif_create fails (e.g. PSRAM OOM), show nothing rather than crash.
+#endif
+    } else {
+        // Static image path — lv_img_set_src accepts a C-string FS path.
+        lv_img_set_src(ui_spriteImg, lvPath.c_str());
+        lv_obj_remove_flag(ui_spriteImg, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -264,6 +306,19 @@ void LcdThread::run() {
     ledcSetup(0, 5000, 12); // 4096 steps @ 5Khz
     ledcAttachPin(5, 0); // LEDC on Pin 5
     lv_init(); // Initialize LVGL
+
+    // Add a PSRAM pool to the LVGL allocator so that lv_gif frame decode
+    // (up to 112 KB per 240x240 RGB565 frame) can use external SPIRAM rather
+    // than the 48 KB internal-SRAM pool.  Safe even if PSRAM is absent —
+    // ps_malloc returns NULL and lv_mem_add_pool is a no-op for NULL.
+    void* psram_buf = ps_malloc(LV_PSRAM_POOL_SIZE);
+    if (psram_buf) {
+        lv_mem_add_pool(psram_buf, LV_PSRAM_POOL_SIZE);
+        Serial.println("[LCD] LVGL PSRAM pool 256 KB registered");
+    } else {
+        Serial.println("[LCD] PSRAM pool alloc failed — GIF decode will use SRAM (may OOM for large GIFs)");
+    }
+
     // Register the sprite 'L:' filesystem driver now that the LVGL heap exists.
     // (Must NOT happen in setup()/SpriteStore::begin() — would crash before lv_init.)
     SpriteStore::registerLvglDriver();

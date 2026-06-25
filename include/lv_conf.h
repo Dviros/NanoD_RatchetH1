@@ -41,14 +41,19 @@
 
 
 #if LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN
-    /*Size of the memory available for `lv_malloc()` in bytes (>= 2kB)*/
-    #define LV_MEM_SIZE (64 * 1024U)          /*[bytes]*/
+    /*Size of the memory available for `lv_malloc()` in bytes (>= 2kB)
+     * 48 KB internal SRAM for widget metadata + small bitmaps.
+     * A PSRAM pool is added at runtime via lv_mem_add_pool() in LcdThread::run()
+     * after lv_init(). GIF decode frames (up to 112 KB per 240x240 RGB565 frame)
+     * are served from that PSRAM pool, keeping internal SRAM free for LVGL core.
+     */
+    #define LV_MEM_SIZE (48 * 1024U)          /*[bytes]*/
 
     /*Size of the memory expand for `lv_malloc()` in bytes*/
     #define LV_MEM_POOL_EXPAND_SIZE 0
 
     /*Set an address for the memory pool instead of allocating it as a normal array. Can be in external SRAM too.*/
-    #define LV_MEM_ADR 0     /*0: unused*/
+    #define LV_MEM_ADR 0     /*0: unused — runtime pool added via lv_mem_add_pool(ps_malloc(...))*/
     /*Instead of an address give a memory allocator that will be called to get a memory pool for LVGL. E.g. my_malloc*/
     #if LV_MEM_ADR == 0
         #undef LV_MEM_POOL_INCLUDE
@@ -366,7 +371,7 @@
 #define LV_FONT_MONTSERRAT_8  0
 #define LV_FONT_MONTSERRAT_10 0
 #define LV_FONT_MONTSERRAT_12 0
-#define LV_FONT_MONTSERRAT_14 1
+#define LV_FONT_MONTSERRAT_14 0
 #define LV_FONT_MONTSERRAT_16 0
 #define LV_FONT_MONTSERRAT_18 0
 #define LV_FONT_MONTSERRAT_20 0
@@ -397,10 +402,10 @@
 /*Optionally declare custom fonts here.
  *You can use these fonts as default font too and they will be available globally.
  *E.g. #define LV_FONT_CUSTOM_DECLARE   LV_FONT_DECLARE(my_font_1) LV_FONT_DECLARE(my_font_2)*/
-#define LV_FONT_CUSTOM_DECLARE
+#define LV_FONT_CUSTOM_DECLARE  LV_FONT_DECLARE(ui_font_SGK100h16)
 
 /*Always set a default font*/
-#define LV_FONT_DEFAULT &lv_font_montserrat_14
+#define LV_FONT_DEFAULT &ui_font_SGK100h16
 
 /*Enable handling large font and/or fonts with a lot of characters.
  *The limit depends on the font size, font face and bpp.
@@ -464,43 +469,32 @@
 
 #define LV_WIDGETS_HAS_DEFAULT_VALUE  1
 
-#define LV_USE_ANIMIMG    1
+/*--- Widget enable/disable: verified against src/ grep 2026-06-25 ---*/
+#define LV_USE_ANIMIMG    0  /* unused: no lv_animimg_create calls */
 
-#define LV_USE_ARC        1
+#define LV_USE_ARC        1  /* USED: ui_Arc1 in ui_valueScreen */
 
-#define LV_USE_BAR        1
+#define LV_USE_BAR        1  /* USED: lv_bar_set_value in ui_helpers.c */
 
-#define LV_USE_BUTTON        1
+#define LV_USE_BUTTON        0  /* unused: no lv_button_create calls */
 
-#define LV_USE_BUTTONMATRIX  1
+#define LV_USE_BUTTONMATRIX  1  /* required by LV_USE_KEYBOARD */
 
-#define LV_USE_CALENDAR   1
-#if LV_USE_CALENDAR
-    #define LV_CALENDAR_WEEK_STARTS_MONDAY 0
-    #if LV_CALENDAR_WEEK_STARTS_MONDAY
-        #define LV_CALENDAR_DEFAULT_DAY_NAMES {"Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"}
-    #else
-        #define LV_CALENDAR_DEFAULT_DAY_NAMES {"Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"}
-    #endif
+#define LV_USE_CALENDAR   0  /* unused */
 
-    #define LV_CALENDAR_DEFAULT_MONTH_NAMES {"January", "February", "March",  "April", "May",  "June", "July", "August", "September", "October", "November", "December"}
-    #define LV_USE_CALENDAR_HEADER_ARROW 1
-    #define LV_USE_CALENDAR_HEADER_DROPDOWN 1
-#endif  /*LV_USE_CALENDAR*/
+#define LV_USE_CANVAS     0  /* unused */
 
-#define LV_USE_CANVAS     1
+#define LV_USE_CHART      0  /* unused */
 
-#define LV_USE_CHART      1
+#define LV_USE_CHECKBOX   0  /* unused */
 
-#define LV_USE_CHECKBOX   1
+#define LV_USE_DROPDOWN   1   /*Requires: lv_label — USED: lv_dropdown_set_selected in ui_helpers.c*/
 
-#define LV_USE_DROPDOWN   1   /*Requires: lv_label*/
+#define LV_USE_IMAGE      1   /*Requires: lv_label — USED: ui_spriteImg lv_img_create*/
 
-#define LV_USE_IMAGE      1   /*Requires: lv_label*/
+#define LV_USE_IMAGEBUTTON     0  /* unused */
 
-#define LV_USE_IMAGEBUTTON     1
-
-#define LV_USE_KEYBOARD   1
+#define LV_USE_KEYBOARD   1  /* USED: lv_keyboard_set_textarea in ui_helpers.c */
 
 #define LV_USE_LABEL      1
 #if LV_USE_LABEL
@@ -509,46 +503,42 @@
     #define LV_LABEL_WAIT_CHAR_COUNT 3  /*The count of wait chart*/
 #endif
 
-#define LV_USE_LED        1
+#define LV_USE_LED        0  /* unused */
 
-#define LV_USE_LINE       1
+#define LV_USE_LINE       0  /* unused */
 
-#define LV_USE_LIST       1
+#define LV_USE_LIST       0  /* unused */
 
-#define LV_USE_MENU       1
+#define LV_USE_MENU       0  /* unused */
 
-#define LV_USE_MSGBOX     1
+#define LV_USE_MSGBOX     0  /* unused: modal built from lv_obj_create */
 
-#define LV_USE_ROLLER     1   /*Requires: lv_label*/
+#define LV_USE_ROLLER     1   /*Requires: lv_label — USED: ui_profList, ui_cNav3*/
 
-#define LV_USE_SCALE      1
+#define LV_USE_SCALE      0  /* unused */
 
-#define LV_USE_SLIDER     1   /*Requires: lv_bar*/
+#define LV_USE_SLIDER     1   /*Requires: lv_bar — USED: lv_slider_set_value in ui_helpers.c*/
 
-#define LV_USE_SPAN       1
-#if LV_USE_SPAN
-    /*A line text can contain maximum num of span descriptor */
-    #define LV_SPAN_SNIPPET_STACK_SIZE 64
-#endif
+#define LV_USE_SPAN       0  /* unused */
 
-#define LV_USE_SPINBOX    1
+#define LV_USE_SPINBOX    1  /* USED: lv_spinbox_increment/decrement in ui_helpers.c */
 
-#define LV_USE_SPINNER    1
+#define LV_USE_SPINNER    0  /* unused */
 
-#define LV_USE_SWITCH     1
+#define LV_USE_SWITCH     0  /* unused */
 
-#define LV_USE_TEXTAREA   1   /*Requires: lv_label*/
+#define LV_USE_TEXTAREA   1   /*Requires: lv_label — REQUIRED by LV_USE_KEYBOARD*/
 #if LV_USE_TEXTAREA != 0
     #define LV_TEXTAREA_DEF_PWD_SHOW_TIME 1500    /*ms*/
 #endif
 
-#define LV_USE_TABLE      1
+#define LV_USE_TABLE      0  /* unused */
 
-#define LV_USE_TABVIEW    1
+#define LV_USE_TABVIEW    0  /* unused */
 
-#define LV_USE_TILEVIEW   1
+#define LV_USE_TILEVIEW   0  /* unused */
 
-#define LV_USE_WIN        1
+#define LV_USE_WIN        0  /* unused */
 
 /*==================
  * THEMES
@@ -582,7 +572,7 @@
 #define LV_USE_FLEX 1
 
 /*A layout similar to Grid in CSS.*/
-#define LV_USE_GRID 1
+#define LV_USE_GRID 0  /* unused: no lv_grid_ calls in src/ */
 
 /*====================
  * 3RD PARTS LIBRARIES
@@ -645,7 +635,7 @@
 #define LV_USE_LIBJPEG_TURBO 0
 
 /*GIF decoder library*/
-#define LV_USE_GIF 0
+#define LV_USE_GIF 1
 #if LV_USE_GIF
 /*GIF decoder accelerate*/
 #define LV_GIF_CACHE_DECODE_DATA 0
@@ -788,7 +778,7 @@
 #define LV_USE_IMGFONT 0
 
 /*1: Enable an observer pattern implementation*/
-#define LV_USE_OBSERVER 1
+#define LV_USE_OBSERVER 0  /* unused: no lv_observer_/lv_subject_ calls in src/ */
 
 /*1: Enable Pinyin input method*/
 /*Requires: lv_keyboard*/
@@ -899,7 +889,7 @@
 *==================*/
 
 /*Enable the examples to be built with the library*/
-#define LV_BUILD_EXAMPLES 1
+#define LV_BUILD_EXAMPLES 0
 
 /*===================
  * DEMO USAGE
