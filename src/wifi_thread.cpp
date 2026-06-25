@@ -425,12 +425,16 @@ void WifiThread::_setupOTA() {
     ArduinoOTA.setHostname(DeviceSettings::getInstance().deviceName.c_str());
 
     ArduinoOTA.onStart([]() {
+        esp_task_wdt_reset();
         Serial.println("[OTA] Start");
     });
     ArduinoOTA.onEnd([]() {
         Serial.println("[OTA] End — resetting");
     });
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        // ArduinoOTA.handle() blocks for the whole multi-second transfer; feed the
+        // task watchdog here (called per chunk) or it resets the device mid-OTA.
+        esp_task_wdt_reset();
         Serial.printf("[OTA] %u%%\r", progress * 100 / total);
     });
     ArduinoOTA.onError([](ota_error_t error) {
