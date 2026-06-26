@@ -64,9 +64,13 @@ void HapticState::load_profile(DetentProfile profile, uint16_t new_position = 0x
     uint16_t isVernier = profile.mode == HapticMode::VERNIER ? profile.vernier : 1;
    
     num_detents = profile.end_pos - profile.start_pos;
-    detent_width = _2PI / profile.detent_count;
+    // Guard divide-by-zero: a detent_count or vernier of 0 (e.g. a Detents/Rotation
+    // field edited to "0" in the app) makes detent_width Inf/NaN, which drives the
+    // FOC target to garbage and stalls/overcurrents the haptic motor — requiring a
+    // power cycle. Clamp both divisors to a safe minimum of 1.
+    detent_width = _2PI / (profile.detent_count > 0 ? profile.detent_count : 1);
 
-    if(profile.mode == HapticMode::VERNIER)
+    if(profile.mode == HapticMode::VERNIER && profile.vernier > 0)
         detent_width /= profile.vernier;
 
     if(new_position != 0xFFFF)
@@ -324,7 +328,11 @@ void HapticInterface::haptic_target(void)
     float error = haptic_state.last_attract_angle - motor->shaft_angle;
     float error_threshold = haptic_state.detent_width * 0.0075; // 0.75% gives good snap without ringing
     // default_pid.output_ramp = haptic_state.detent_profile.output_ramp;
-    haptic_pid->output_ramp = haptic_state.detent_profile.output_ramp;
+    // Clamp the haptic PID output ramp. Extreme values (the app's old 10000 max)
+    // slew the motor output too fast, producing audible coil whine / static and
+    // current spikes. 5000 is the proven default; cap there. Floor at 1 to keep
+    // the PID well-defined.
+    haptic_pid->output_ramp = constrain(haptic_state.detent_profile.output_ramp, 1.0f, 5000.0f);
      // Prevent knob velocity from getting too high and overshooting.
     // If the position error is small, reduce strength to prevent oscillation
     if(fabsf(error) < error_threshold)
