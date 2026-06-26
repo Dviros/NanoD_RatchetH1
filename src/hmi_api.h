@@ -35,6 +35,11 @@ typedef struct {
 } nanoMouseConfig;
 
 
+typedef struct {
+    uint16_t usage;  // HID Consumer Control usage (16-bit), e.g. 0xCD PlayPause
+} nanoConsumerConfig;
+
+
 
 
 
@@ -48,7 +53,8 @@ typedef enum {
     KA_GAMEPAD = 4,
     KA_PROFILE_CHANGE = 5,
     KA_PROFILE_NEXT = 6,
-    KA_PROFILE_PREV = 7
+    KA_PROFILE_PREV = 7,
+    KA_CONSUMER = 8   // USB HID Consumer Control (page 0x0C)
 } keyActionType;
 
 
@@ -59,6 +65,7 @@ typedef struct {
         nanoKeyboardConfig hid;
         nanoMouseConfig mouse;
         nanoGamepadConfig pad;
+        nanoConsumerConfig consumer;  // KA_CONSUMER: 16-bit HID usage code
     };
     String profile="";
 } keyAction;
@@ -80,7 +87,8 @@ typedef enum {
     KV_GAMEPAD = 2,
     KV_MIDI = 3,
     KV_ACTIONS = 4,
-    KV_DEVICE_PROFILES = 5 
+    KV_DEVICE_PROFILES = 5,
+    KV_VOLUME = 6   // USB HID Consumer VolumeUp/VolumeDown per detent
 } knobValueType;
 
 

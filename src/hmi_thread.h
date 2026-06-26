@@ -96,6 +96,11 @@ class HmiThread : public Thread<HmiThread> {
         uint8_t last_mouse_buttons = 0;
         uint8_t current_pad_buttons = 0;
         uint8_t last_pad_buttons = 0;
+        uint16_t current_consumer_usage = 0;   // KA_CONSUMER: active usage code (0 = released)
+        uint16_t last_consumer_usage = 0;
+        // KV_VOLUME: a one-shot usage queued by updateValue() for handleHid() to send then auto-release
+        volatile uint16_t pending_volume_usage = 0;
+        volatile bool pending_volume_release = false;
 
         // button handler
         void handleKeyAction(keyAction& action, uint8_t eventType);

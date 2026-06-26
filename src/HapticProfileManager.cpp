@@ -474,6 +474,11 @@ HapticProfile& HapticProfile::operator=(JsonObject& obj) {
           dirty = true;
           // TODO fields
         }
+        else if (type=="volume") {
+          hmi_config.knob.values[i].type = knobValueType::KV_VOLUME;
+          dirty = true;
+          // No extra fields — VolumeUp/VolumeDown direction is determined at runtime from value delta
+        }
       }
     }
   }
@@ -560,6 +565,11 @@ void HapticProfile::keyActionFromJSON(JsonObject& obj, keyAction& action) {
     }
     else if (type=="prev_profile") {
       action.type = keyActionType::KA_PROFILE_PREV;
+      dirty = true;
+    }
+    else if (type=="consumer") {
+      action.type = keyActionType::KA_CONSUMER;
+      action.consumer.usage = obj["usage"].is<uint16_t>() ? obj["usage"].as<uint16_t>() : 0;
       dirty = true;
     }
     else {
@@ -676,6 +686,9 @@ void HapticProfile::toJSON(JsonObject& doc){
       case knobValueType::KV_DEVICE_PROFILES:
         value["type"] = "profiles"; // TODO implement knob profile change
         break;
+      case knobValueType::KV_VOLUME:
+        value["type"] = "volume";
+        break;
     }
   }
   // other configs
@@ -725,7 +738,11 @@ void HapticProfile::keyActionToJSON(JsonObject& obj, keyAction& action){
     case keyActionType::KA_PROFILE_PREV:
       obj["type"] = "prev_profile";
       break;
-  }      
+    case keyActionType::KA_CONSUMER:
+      obj["type"] = "consumer";
+      obj["usage"] = action.consumer.usage;
+      break;
+  }
 };
 
 

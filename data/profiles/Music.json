@@ -1,0 +1,54 @@
+{
+  "version": 2,
+  "name": "Music",
+  "desc": "Media transport + system volume via USB HID Consumer Control",
+  "profileTag": "media",
+  "ledEnable": true,
+  "ledBrightness": 120,
+  "ledMode": 0,
+  "pointer": 16777215,
+  "primary": 2236962,
+  "secondary": 1118481,
+  "buttonAIdle": 1118481,
+  "buttonBIdle": 1118481,
+  "buttonCIdle": 1118481,
+  "buttonDIdle": 1118481,
+  "buttonAPress": 16777215,
+  "buttonBPress": 16777215,
+  "buttonCPress": 16777215,
+  "buttonDPress": 16777215,
+  "keys": [
+    { "pressed": [ { "type": "consumer", "usage": 205 } ] },
+    { "pressed": [ { "type": "consumer", "usage": 181 } ] },
+    { "pressed": [ { "type": "consumer", "usage": 182 } ] },
+    { "pressed": [ { "type": "consumer", "usage": 226 } ] }
+  ],
+  "knob": [
+    {
+      "type": "volume",
+      "valueMin": 0,
+      "valueMax": 100,
+      "angleMin": 0,
+      "angleMax": 6.283185,
+      "wrap": false,
+      "step": 1,
+      "keyState": 0,
+      "haptic": {
+        "mode": 0,
+        "startPos": 0,
+        "endPos": 100,
+        "detentCount": 100,
+        "vernier": 5,
+        "kxForce": false,
+        "outputRamp": 5000.0,
+        "detentStrength": 3.0
+      }
+    }
+  ],
+  "guiEnable": false,
+  "audio": {
+    "clickType": "hard",
+    "keyClickType": "clack",
+    "clickLevel": 100
+  }
+}

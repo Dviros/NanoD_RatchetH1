@@ -18,13 +18,15 @@ enum {
   RID_KEYBOARD = 1,
   RID_MOUSE = 2,
   RID_GAMEPAD = 3,
+  RID_CONSUMER = 4,  // USB HID Consumer Control (page 0x0C)
 };
 
 
 uint8_t const desc_hid_report[] = {
   TUD_HID_REPORT_DESC_KEYBOARD( HID_REPORT_ID(RID_KEYBOARD) ),
   TUD_HID_REPORT_DESC_MOUSE   ( HID_REPORT_ID(RID_MOUSE) ),
-  TUD_HID_REPORT_DESC_GAMEPAD( HID_REPORT_ID(RID_GAMEPAD) )
+  TUD_HID_REPORT_DESC_GAMEPAD ( HID_REPORT_ID(RID_GAMEPAD) ),
+  TUD_HID_REPORT_DESC_CONSUMER( HID_REPORT_ID(RID_CONSUMER) ),
 };
 
 // USB HID object
@@ -315,6 +317,12 @@ void HmiThread::handleKeyAction(keyAction& action, uint8_t eventType) {
             if (eventType==AceButton::kEventPressed)
                 com_thread.put_string_message(msg);
         break;
+        case keyActionType::KA_CONSUMER:
+            if (eventType==AceButton::kEventPressed)
+                current_consumer_usage = action.consumer.usage;
+            else if (eventType==AceButton::kEventReleased)
+                current_consumer_usage = 0;
+        break;
     }
 };
 
@@ -355,6 +363,16 @@ void HmiThread::updateValue() {
                         if (midi2Settings.nano)
                             midi2.sendControlChange(v.midi.cc, midi_value, v.midi.channel);
                     }
+                    else if (v.type==knobValueType::KV_VOLUME) {
+                        // Queue one Consumer VolumeUp/VolumeDown pulse per detent crossing.
+                        // handleHid() drains the queue in two successive HID-ready windows:
+                        // first sends the usage, then sends 0 (release) on the next iteration.
+                        // Direction is determined by sign of value change.
+                        pending_volume_usage = (currentValue > lastValue)
+                            ? (uint16_t)HID_USAGE_CONSUMER_VOLUME_INCREMENT   // 0xE9
+                            : (uint16_t)HID_USAGE_CONSUMER_VOLUME_DECREMENT;  // 0xEA
+                        pending_volume_release = false;
+                    }
                     lastValue = currentValue;
                 }
             }
@@ -369,8 +387,9 @@ void HmiThread::handleHid() {
     bool keys_changed = (num_key_codes!=last_num_key_codes);
     bool mouse_changed = (current_mouse_buttons!=last_mouse_buttons);
     bool pad_changed = (current_pad_buttons!=last_pad_buttons);
+    bool consumer_changed = (current_consumer_usage!=last_consumer_usage);
 
-    if ( TinyUSBDevice.suspended() && (keys_changed||mouse_changed||pad_changed) ) {
+    if ( TinyUSBDevice.suspended() && (keys_changed||mouse_changed||pad_changed||consumer_changed) ) {
         TinyUSBDevice.remoteWakeup();
     }
 
@@ -399,6 +418,23 @@ void HmiThread::handleHid() {
             };
             usb_hid.sendReport(RID_GAMEPAD, &report, sizeof(report));
             last_pad_buttons = current_pad_buttons;
+        }
+        if (consumer_changed) {
+            usb_hid.sendReport(RID_CONSUMER, &current_consumer_usage, sizeof(current_consumer_usage));
+            last_consumer_usage = current_consumer_usage;
+        }
+        // KV_VOLUME: drain one-shot volume pulse (press then release in successive handleHid() calls)
+        if (pending_volume_usage != 0 && !pending_volume_release) {
+            uint16_t usage_snap = pending_volume_usage;
+            if (usb_hid.sendReport(RID_CONSUMER, &usage_snap, sizeof(usage_snap))) {
+                pending_volume_release = true;  // next call sends the release
+            }
+        } else if (pending_volume_release) {
+            uint16_t release = 0;
+            if (usb_hid.sendReport(RID_CONSUMER, &release, sizeof(release))) {
+                pending_volume_usage = 0;
+                pending_volume_release = false;
+            }
         }
     }
 };
