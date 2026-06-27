@@ -6,6 +6,54 @@ desktop application (`app/`).
 
 ---
 
+## [1.2.0] — 2026-06-28 — Album artwork & music profile
+
+### Added — Firmware
+
+#### Album artwork display (`src/lcd_thread.cpp`, `src/sprite_store.cpp`)
+
+- **RGB565 artwork streaming**: the host pre-renders album art as a 240×240
+  little-endian RGB565 frame and uploads it as a `.rgb565` sprite (115200 bytes).
+  The firmware streams the frame from flash to the GC9A01 in 16-row strips via
+  TFT_eSPI — the full image never resides in RAM, so artwork works on this
+  PSRAM-less board.
+- **Music profile idle/active behaviour**: when a `.rgb565` sprite is active the
+  LCD shows the album cover while the knob is idle, then switches to the native
+  value screen (big volume number + arc) while the knob turns, and returns to
+  the cover ~1.2 s after it stops. LVGL is paused while the raw frame is on
+  screen.
+
+#### Binary fast-path sprite upload (`src/sprite_store.cpp`, `src/com_thread.cpp`)
+
+- **`binbegin` / `binchunk` / `end` upload path**: ~10× faster than the base64
+  `data` path (~2.5 s vs ~13 s for a 115 KB RGB565 frame). After
+  `{"sprite":{"op":"binbegin",...}}`, each chunk is a JSON header
+  `{"sprite":{"op":"binchunk","len":N}}` followed immediately by N raw bytes.
+  The device reads the bytes into RAM, commits them to flash in one write, and
+  responds `{"binack":{"rd":<total>,"ok":true}}`. The host must wait for the
+  `binack` before sending the next chunk (chunk-ack barrier prevents overlapping
+  reads and flash writes). Recommended chunk size: 4096 bytes; the USB-CDC RX
+  queue is enlarged to 8 KB so a full chunk cannot overflow it.
+- **Motor parks during upload**: the FOC thread applies zero torque while a
+  binary upload is active, eliminating knob buzz from flash-write stalls on the
+  shared bus. Haptic detents resume automatically when the upload ends.
+
+#### New serial commands
+
+- **`{"ring":{"primary":<0xRRGGBB>,"secondary":<0xRRGGBB>,"mode":<0-3>}}`**:
+  pushes a transient LED config to the HMI thread in the current album palette
+  without modifying the saved profile. Also stores `primary` as the album color
+  for LCD music overlays (seek arc, cover-to-value transitions).
+- **`{"seek":{"pos":<0.0..1.0>}}`**: sets the song-progress arc on the LED ring
+  (album color, same geometry as the volume pointer). `pos < 0` hides the arc.
+- **`{"reboot":true}`**: ACK then `esp_restart()`.
+- **`{"reboot":"bootloader"}`**: ACK then `usb_persist_restart(RESTART_BOOTLOADER)` —
+  restarts the ESP32-S3 into ROM USB download mode with native USB kept enumerated
+  for buttonless firmware flashing via `esptool`. A manual EN-button tap boots
+  the new image after flashing.
+
+---
+
 ## [1.1.0] — 2024-05-28
 
 ### Upgrade notes

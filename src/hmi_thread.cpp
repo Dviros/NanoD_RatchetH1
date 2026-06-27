@@ -507,7 +507,20 @@ void HmiThread::updateLeds() {
     uint16_t end = map(end_pos, end_pos, start_pos, 0, NANO_LED_A_NUM - 1);
 
 
-     if (com_thread.global_sleep_flag) {
+    // Knob-turning detector: while moving show volume (pointer); when still and a
+    // cover is up, show song progress on the ring instead.
+    static uint16_t led_last_pos = 0;
+    static unsigned long led_pos_ts = 0;
+    if (cur_pos != led_last_pos) { led_pos_ts = millis(); led_last_pos = cur_pos; }
+    bool turning = (millis() - led_pos_ts < 1000);
+    bool cover   = DeviceSettings::getInstance().getActiveSprite().endsWith(".rgb565");
+
+    if (cover && !turning) {
+        // Music idle: song-progress bar on the ring, album color (no R/G/B cycle).
+        seekRing(DeviceSettings::getInstance().seekPermille, CRGB(led_config.primary_col), led_orientation);
+        updateKeyLeds();
+        FastLED.setBrightness(min(led_max_brightness, led_config.led_brightness));
+    } else if (com_thread.global_sleep_flag && !cover) {
         hmi_thread.IdleLeds(25, CRGB::Red, CRGB::Green, CRGB::Blue);
         FastLED.setBrightness(25);
     } else {
@@ -537,6 +550,24 @@ void HmiThread::halvesPointer(int indicator, int startpos, int endpos, int orien
     int index = ( indicator + orientation) % NANO_LED_A_NUM;
     leds[index] = pointerCol;
     return;
+};
+
+// Song-progress bar on the ring, drawn with the SAME geometry as the volume
+// pointer (halvesPointer): same `(i + orientation)` mapping, and progress grows in
+// the same direction the volume increases (toward the volume-max end of the ring).
+// permille < 0 (no seek yet) → full album ring.
+void HmiThread::seekRing(int permille, const struct CRGB& col, int orientation){
+    CRGB lit = col;
+    CRGB dim = col; dim.nscale8(28);
+    int N = NANO_LED_A_NUM;
+    // thresh: N-1 at 0% (one lit LED at the origin) → 0 at 100% (full ring), mirroring
+    // the volume's map(cur_pos, end_pos, start_pos, 0, N-1). Lit = i >= thresh.
+    int thresh = (permille < 0) ? 0 : ((N - 1) * (1000 - permille)) / 1000;
+    for (int i = 0; i < N; i++) {
+        int index = (i + orientation) % N;
+        leds[index] = (i >= thresh) ? lit : dim;
+    }
+    for (int i = 0; i < NANO_LED_B_NUM; i++) ledsp[i] = lit;
 };
 
 /*

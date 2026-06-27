@@ -417,7 +417,18 @@ void ComThread::processCommand(JsonDocument& doc, ComThread& self) {
       cfg.secondary_col = v["secondary"] | cfg.secondary_col;
       cfg.led_mode      = v["mode"]      | cfg.led_mode;
       hmi_thread.put_led_config(cfg);
+      DeviceSettings::getInstance().musicColor = cfg.primary_col;  // album color for LCD overlays
       self.sendAck("ring", true);
+    }
+
+    // {"seek":{"pos":<0.0..1.0>}} — song progress for the on-screen seek arc
+    // (drawn over the cover by the LCD thread in the album color). pos<0 hides it.
+    v = doc["seek"];
+    if (!v.isNull()) {
+      float pos = v["pos"] | -1.0f;
+      DeviceSettings::getInstance().seekPermille =
+          pos < 0 ? -1 : (int32_t)(constrain(pos, 0.0f, 1.0f) * 1000.0f);
+      self.sendAck("seek", true);
     }
 }
 

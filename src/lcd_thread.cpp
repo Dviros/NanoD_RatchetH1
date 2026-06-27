@@ -402,6 +402,35 @@ static void lcd_stream_rgb565(const String& name) {
     f.close();
 }
 
+// ── Volume display over the cover ────────────────────────────────────────────
+// Turning the knob shows the device's OWN value screen (ui_valueScreen: big number
+// ui_posind + ring ui_Arc1, kept current by counter_handler) — native font, no
+// TFT text. When the knob stops, the cover comes back. Song progress lives on the
+// LED ring (HmiThread::seekRing). Volume comes from the knob position, real-time.
+static int           s_mus_last_vol = -1;
+static unsigned long s_mus_vol_ts   = 0;
+
+static void music_reset() {
+    // Seed last_vol with the live position so a freshly loaded cover stays on the
+    // cover (not the value screen) until the knob actually moves.
+    s_mus_last_vol = constrain((int)foc_thread.pass_cur_pos(), 0, 100);
+}
+
+static void music_overlay(const String& active) {
+    int vol = constrain((int)foc_thread.pass_cur_pos(), 0, 100);
+    if (vol != s_mus_last_vol) {                    // knob turning → native value screen
+        s_mus_vol_ts = millis(); s_mus_last_vol = vol;
+        if (s_raw_image) {
+            lv_screen_load(ui_valueScreen);         // number + ring in the device's own font
+            lv_obj_invalidate(ui_valueScreen);      // FULL redraw — its opaque bg wipes the raw
+            s_raw_image = false;                    // cover from the framebuffer (no show-through,
+                                                    // no arc trails). then un-pause LVGL.
+        }
+    } else if (!s_raw_image && millis() - s_mus_vol_ts >= 1200) {
+        lcd_stream_rgb565(active);                   // knob idle → back to the cover
+    }
+}
+
 void LcdThread::run() {
     // Setup LedC
     ledcSetup(0, 5000, 12); // 4096 steps @ 5Khz
@@ -471,6 +500,7 @@ void LcdThread::run() {
             last_sprite = active;
             if (active.endsWith(".rgb565") && SpriteStore::exists(active)) {
                 lcd_stream_rgb565(active);                  // sets s_raw_image = true
+                music_reset();                              // fresh overlay state for the new cover
             } else {
                 bool was_raw = s_raw_image;
                 s_raw_image = false;
@@ -479,7 +509,8 @@ void LcdThread::run() {
             }
         }
 
-        if (!s_raw_image) lv_timer_handler();
+        if (active.endsWith(".rgb565")) music_overlay(active);  // toggle cover ↔ value screen
+        if (!s_raw_image) lv_timer_handler();                   // render LVGL when not on the cover
         lv_tick_inc(10);
         vTaskDelay(1 / portTICK_PERIOD_MS);
     }

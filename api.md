@@ -25,6 +25,10 @@ The API is not for end-user consumption — it is the low-level wire protocol us
 | `screen`:`{...}` | H→D          | no       | no                 | Set LCD layout fields |
 | `wifi`:`{...}`  | H→D           | yes      | `"wifi"`           | Update WiFi credentials / state |
 | `sprite`:`{...}` | H→D          | yes      | `"sprite"`         | Sprite upload / management |
+| `ring`:`{...}`  | H→D           | yes      | `"ring"`           | Transient album-color LED push (does not save) |
+| `seek`:`{...}`  | H→D           | yes      | `"seek"`           | Set song-progress arc on LED ring |
+| `reboot`:`true` | H→D           | yes      | `"reboot"`         | Normal restart via `esp_restart()` |
+| `reboot`:`"bootloader"` | H→D  | yes      | `"reboot"`         | Restart into ROM USB download mode (esptool target) |
 
 ---
 
@@ -110,14 +114,20 @@ See [communications.md — Settings](communications.md) for the full table. Key 
 
 ## Sprite command ops summary
 
-| `op`     | Required fields          | Effect                                |
-|----------|--------------------------|---------------------------------------|
-| `begin`  | `name`, `size`           | Start upload session                  |
-| `data`   | `seq`, `data` (base64)   | Send one chunk (must be in sequence)  |
-| `end`    | `crc32`                  | Finalise and validate upload          |
-| `list`   | —                        | Confirms success; names not returned (see communications.md) |
-| `select` | `name` (optional)        | Set active sprite; empty = deselect   |
-| `delete` | `name`                   | Remove sprite from LittleFS           |
+| `op`        | Required fields            | Effect                                          |
+|-------------|----------------------------|-------------------------------------------------|
+| `begin`     | `name`, `size`             | Start base64 upload session                     |
+| `data`      | `seq`, `data` (base64)     | Send one chunk (must be in sequence)            |
+| `binbegin`  | `name`, `size`             | Start binary fast-path upload (~10x faster)     |
+| `binchunk`  | `len` + raw bytes on wire  | Send `len` raw bytes; wait for `binack` before next |
+| `end`       | `crc32`                    | Finalise and validate upload (both paths)       |
+| `list`      | —                          | Returns `{"sprites":[{"name":"...","size":N},...]}` |
+| `select`    | `name` (optional)          | Set active sprite; empty = deselect             |
+| `delete`    | `name`                     | Remove sprite from LittleFS                     |
+
+Binary chunk response (one per `binchunk`): `{ "binack": { "rd": <bytes_so_far>, "ok": true } }`
+
+Sprite type note: `.rgb565` files are raw 240×240 little-endian RGB565 frames (115200 bytes) streamed straight to the GC9A01 LCD — no PSRAM required.
 
 LVGL filesystem path for stored sprites: `L:/sprites/<name>`
 

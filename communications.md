@@ -85,7 +85,7 @@ Every mutating command emits an ACK after processing:
 { "ack": "<command>", "ok": false, "error": "Reason text." }
 ```
 
-The `"error"` key is present only when `"ok"` is `false`. Commands that emit ACKs: `boot`, `current`, `recalibrate`, `settings`, `save`, `load`, `profile`, `profiles`, `message`, `wifi`, `sprite`.
+The `"error"` key is present only when `"ok"` is `false`. Commands that emit ACKs: `boot`, `current`, `recalibrate`, `settings`, `save`, `load`, `profile`, `profiles`, `message`, `wifi`, `sprite`, `ring`, `seek`, `reboot`.
 
 Read-only queries (e.g. `{"profile":"Foo"}` without `"updates"`, or `{"settings":"?"}`) do not emit an ACK — they emit only the response data.
 
@@ -533,6 +533,118 @@ Response: `{ "ack": "sprite", "ok": true }`
 Response: `{ "ack": "sprite", "ok": true }` or `{ "ack": "sprite", "ok": false, "error": "not found" }`
 
 If the deleted sprite was the active sprite, `DeviceSettings.activeSprite` is cleared.
+
+### Binary fast-path upload
+
+A ~10x faster alternative to the base64 `data` chunks for large files such as album artwork. The host sends raw bytes instead of base64-encoded JSON per chunk, eliminating the encoding overhead and reducing a 240×240 RGB565 frame upload from ~13 s to ~2.5 s.
+
+**Step 1 — begin:**
+
+```json
+{ "sprite": { "op": "binbegin", "name": "cover.rgb565", "size": 115200 } }
+```
+
+The device opens the file (same name/size validation as `begin`) and marks the session as binary. Response: `{ "ack": "sprite", "ok": true }`.
+
+**Step 2 — send chunks:**
+
+For each chunk, send a JSON header line immediately followed by exactly `len` raw bytes (no base64, no further JSON framing):
+
+```json
+{ "sprite": { "op": "binchunk", "len": 4096 } }
+```
+↓ followed immediately by 4096 raw bytes
+
+The device reads the raw bytes into RAM and commits them to flash in one write. It then responds:
+
+```json
+{ "binack": { "rd": 4096, "ok": true } }
+```
+
+| Field | Type   | Meaning                              |
+|-------|--------|--------------------------------------|
+| `rd`  | uint32 | Total bytes committed to flash so far |
+| `ok`  | bool   | `false` if the write failed; upload is aborted |
+
+The host **must** wait for the `binack` before sending the next chunk. This barrier ensures reads and flash writes never overlap — a slow LittleFS write cannot drop bytes from the USB-CDC RX queue because the host has no bytes in flight during the flash write.
+
+The firmware buffers up to 4096 bytes per chunk. The USB-CDC RX queue is enlarged to 8 KB (`Serial.setRxBufferSize(8192)`) so a full 4096-byte chunk cannot overflow it. Recommended chunk size: **4096 bytes**.
+
+**Step 3 — finalise:**
+
+```json
+{ "sprite": { "op": "end", "name": "cover.rgb565", "crc32": 3456789012 } }
+```
+
+The normal `end` sub-command validates total byte count and CRC-32. Response: `{ "ack": "sprite", "ok": true }` or `{ "ack": "sprite", "ok": false, "error": "..." }`.
+
+**Motor behaviour during upload:** the FOC thread parks the motor (zero torque) while `binReceiving()` is true, eliminating knob buzz caused by flash-write stalls on the shared bus. Normal haptic detents resume automatically when the upload ends.
+
+### RGB565 sprite type
+
+A `.rgb565` file is a raw 240×240 little-endian RGB565 frame (115200 bytes). The firmware streams it directly from flash to the GC9A01 LCD in 16-row strips via TFT_eSPI, so the full frame never resides in RAM. This is the artwork path for this PSRAM-less board.
+
+When a `.rgb565` sprite is active the LCD alternates between the cover (idle) and the native value screen (knob turning — shows the volume number and arc). LVGL is paused while the raw frame is on screen to prevent overwriting the LCD bus.
+
+---
+
+## Ring command
+
+Sets a transient album-color LED glow on the HMI thread without modifying the saved profile.
+
+```json
+{ "ring": { "primary": 16711680, "secondary": 3342336, "mode": 1 } }
+```
+
+| Field       | Type   | Required | Notes                                     |
+|-------------|--------|----------|-------------------------------------------|
+| `primary`   | uint32 | no       | Primary LED color as 0xRRGGBB integer     |
+| `secondary` | uint32 | no       | Secondary LED color as 0xRRGGBB integer   |
+| `mode`      | uint8  | no       | LED mode (0–3, same values as `ledMode`)  |
+
+The command merges the provided fields into a copy of the current profile's `led_config` and pushes it to the HMI thread immediately. It also stores `primary` as the album color used by the LCD music overlays (seek arc, cover-to-value-screen transitions).
+
+This push is **transient**: the saved profile is not modified, and the profile's original LED colors reassert the next time `{"current":...}` or `{"settings":...}` is dispatched.
+
+Response: `{ "ack": "ring", "ok": true }`
+
+---
+
+## Seek command
+
+Sets the song-progress position displayed as an arc on the LED ring.
+
+```json
+{ "seek": { "pos": 0.45 } }
+```
+
+| Field | Type  | Required | Notes                                                   |
+|-------|-------|----------|---------------------------------------------------------|
+| `pos` | float | yes      | Progress 0.0–1.0; negative value hides the seek arc    |
+
+The arc uses the album color set by the most recent `{"ring":...}` command and shares the same physical geometry as the volume pointer. A value below 0 removes the arc from display.
+
+Response: `{ "ack": "seek", "ok": true }`
+
+---
+
+## Reboot command
+
+```json
+{ "reboot": true }
+```
+
+The device sends an ACK then calls `esp_restart()` (normal warm restart).
+
+```json
+{ "reboot": "bootloader" }
+```
+
+The device sends an ACK then calls `usb_persist_restart(RESTART_BOOTLOADER)`, which restarts the ESP32-S3 into ROM USB download mode with the native USB kept enumerated. This allows buttonless firmware flashing: the host can then run `esptool` to flash the new firmware. Note that `esptool` cannot autonomously reset this native-USB board after flashing, so a manual EN-button tap is required to boot the new image.
+
+Any value other than `true` or `"bootloader"` is silently ignored.
+
+Response: `{ "ack": "reboot", "ok": true }` (emitted before the restart)
 
 ---
 

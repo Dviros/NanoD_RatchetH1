@@ -57,6 +57,7 @@ class HmiThread : public Thread<HmiThread> {
         // Light Effects
         void halvesPointer(int indicator, int startpos, int endpos, int orientation, const struct CRGB& pointerCol, const struct CRGB& preCol, const struct CRGB& postCol);
         void IdleLeds(int fps, const struct CRGB& idleColStart, const struct CRGB& idleColMid, const struct CRGB& idleColEnd);
+        void seekRing(int permille, const struct CRGB& col, int orientation);  // song-progress bar on the ring
 
         void handleSysex(byte* array, unsigned size);
 

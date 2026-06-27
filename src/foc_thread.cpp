@@ -2,6 +2,7 @@
 #include "utils.h"
 #include "HapticCommander.h"
 #include "./com_thread.h"
+#include "sprite_store.h"   // SpriteStore::binReceiving() — park the motor during uploads
 
 
 /*
@@ -77,7 +78,10 @@ void FocThread::run() {
     uint16_t serial_last_pos = 0;
     while (true) {
         // Drive non-blocking recalibration; skip haptic output while in progress.
-        if (!commander.tickRecalibration()) {
+        // Also park the motor (no torque) during a binary sprite upload: LittleFS
+        // flash writes stall this core's cached code, so holding detents makes the
+        // knob buzz. Free-spin for the ~3 s upload, then detents resume.
+        if (!commander.tickRecalibration() && !SpriteStore::binReceiving()) {
             haptic.haptic_loop();
         }
         float ang = encoder.getAngle();

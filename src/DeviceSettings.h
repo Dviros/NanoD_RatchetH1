@@ -163,6 +163,12 @@ public:
     float pdVoltage;      // [5.0, 9.0] V
     String activeSprite;
 
+    // Transient music-profile overlay state — LCD thread reads, com thread writes.
+    // Plain 32-bit fields: aligned loads/stores are atomic on the ESP32, and a
+    // one-frame stale read would only blip a cosmetic overlay. No mutex needed.
+    uint32_t musicColor   = 0x08596C;   // album color for volume/seek arcs (0xRRGGBB)
+    int32_t  seekPermille = -1;         // song progress 0..1000; -1 = hide seek arc
+
     // Network PSK — internal only; never serialise plaintext; use getNetPsk()
     String netPsk;
 
