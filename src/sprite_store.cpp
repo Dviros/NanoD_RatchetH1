@@ -30,6 +30,7 @@
 // ---------------------------------------------------------------------------
 static constexpr size_t  MAX_SPRITE_SIZE   = 64  * 1024;  // 64 KB per static sprite (bmp/png)
 static constexpr size_t  MAX_GIF_SIZE      = 200 * 1024;  // 200 KB per GIF sprite
+static constexpr size_t  MAX_RGB565_SIZE   = 128 * 1024;  // 240x240x2 = 115 KB raw frame + margin
 static constexpr size_t  MAX_SPRITES_BYTES = 768 * 1024;  // 768 KB total (raised from 512 KB for GIF)
 static constexpr uint8_t MAX_SPRITES       = 16;
 // GIF logical-screen cap. gifdec allocates one contiguous 5*w*h block; 240x240
@@ -167,6 +168,20 @@ static bool is_gif_name(const char* name) {
             (ext[3] == 'f' || ext[3] == 'F'));
 }
 
+// Raw full-screen RGB565 frame (.rgb565): pre-rendered by the host, streamed
+// straight to the LCD (no decode, no RAM frame) — the no-PSRAM artwork path.
+static bool is_raw565_name(const char* name) {
+    size_t n = strlen(name);
+    return n >= 7 && strcasecmp(name + n - 7, ".rgb565") == 0;
+}
+
+// Per-type upload size cap.
+static size_t effective_max(const char* name) {
+    if (is_gif_name(name))    return MAX_GIF_SIZE;
+    if (is_raw565_name(name)) return MAX_RGB565_SIZE;
+    return MAX_SPRITE_SIZE;
+}
+
 static bool handle_begin(JsonObjectConst cmd, String& err) {
     // Abort any prior stale upload.
     abort_upload();
@@ -178,9 +193,8 @@ static bool handle_begin(JsonObjectConst cmd, String& err) {
         err = "invalid name"; return false;
     }
 
-    // Choose size limit based on file type: GIFs may be larger.
-    size_t effective_max = is_gif_name(name) ? MAX_GIF_SIZE : MAX_SPRITE_SIZE;
-    if (size == 0 || size > effective_max) {
+    // Choose size limit based on file type: GIFs and raw RGB565 frames may be larger.
+    if (size == 0 || size > effective_max(name)) {
         err = "invalid size"; return false;
     }
     // Reject if adding would overflow total budget.
@@ -232,7 +246,7 @@ static bool handle_data(JsonObjectConst cmd, String& err) {
         free(buf); abort_upload(); err = "base64 decode error"; return false;
     }
 
-    size_t upload_max = is_gif_name(g_upload.name.c_str()) ? MAX_GIF_SIZE : MAX_SPRITE_SIZE;
+    size_t upload_max = effective_max(g_upload.name.c_str());
     if (g_upload.written + (size_t)dec > upload_max) {
         free(buf); abort_upload(); err = "size overflow"; return false;
     }

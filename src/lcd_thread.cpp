@@ -33,6 +33,16 @@ static lv_obj_t* s_sprite_layer = nullptr;
 // source instead. The buffer must outlive the lv_img that references it.
 static uint8_t*       s_png_buf = nullptr;
 static lv_image_dsc_t s_png_dsc;
+// LVGL's lodepng image decoder never gets our sprite to the screen (file path
+// uses C fopen which can't read the "L:" LittleFS drive; the in-memory path
+// decodes the header but yields a 0x0 widget). So we call lodepng directly and
+// pre-decode to ARGB8888 ourselves. lodepng_decode32 is non-static in LVGL's
+// bundled lodepng and allocates output via lv_malloc (the 2 MB PSRAM pool).
+extern "C" unsigned lodepng_decode32(unsigned char** out, unsigned* w, unsigned* h,
+                                     const unsigned char* in, size_t insize);
+// Raw full-screen image mode: when a .rgb565 sprite is active we stream it
+// straight to the GC9A01 (no PSRAM needed) and PAUSE LVGL so it can't overwrite.
+static volatile bool s_raw_image = false;
 
 
 // TODO: Move to PIO Build Flags
@@ -320,34 +330,76 @@ void lcd_show_sprite(const String& name) {
         File fp = LittleFS.open(fsPath.c_str(), "r");
         if (fp) {
             size_t sz = fp.size();
-            s_png_buf = (uint8_t*)lv_malloc(sz);
-            if (s_png_buf && fp.read(s_png_buf, sz) == sz) {
-                lv_memzero(&s_png_dsc, sizeof(s_png_dsc));
-                s_png_dsc.header.magic = LV_IMAGE_HEADER_MAGIC; // mark as a real image descriptor
-                s_png_dsc.header.cf    = LV_COLOR_FORMAT_RAW;   // encoded bytes; lodepng decodes
-                s_png_dsc.data         = s_png_buf;
-                s_png_dsc.data_size    = sz;
-                lv_obj_t* img = lv_img_create(s_sprite_layer);
-                lv_img_set_src(img, &s_png_dsc);
-                lv_obj_center(img);
-            } else if (s_png_buf) {
-                lv_free(s_png_buf); s_png_buf = nullptr;   // alloc or short read → fall back to dial
-            }
+            uint8_t* enc = (uint8_t*)lv_malloc(sz);              // encoded PNG bytes
+            size_t rd = enc ? fp.read(enc, sz) : 0;
             fp.close();
+            if (enc && rd == sz) {
+                unsigned w = 0, h = 0;
+                uint8_t* px = nullptr;                           // RGBA, lv_malloc'd by lodepng
+                unsigned err = lodepng_decode32(&px, &w, &h, enc, sz);
+                lv_free(enc);                                    // encoded bytes no longer needed
+                Serial.printf("[LCD] PNG decode err=%u %ux%u px=%p\n", err, w, h, (void*)px);
+                if (!err && px && w && h) {
+                    // lodepng gives RGBA; LVGL ARGB8888 is BGRA in memory — swap R<->B
+                    // (mirrors LVGL lodepng's own convert_color_depth()).
+                    for (size_t i = 0; i < (size_t)w * h; i++) {
+                        uint8_t t = px[i * 4]; px[i * 4] = px[i * 4 + 2]; px[i * 4 + 2] = t;
+                    }
+                    s_png_buf = px;                              // freed with lv_free on teardown
+                    lv_memzero(&s_png_dsc, sizeof(s_png_dsc));
+                    s_png_dsc.header.magic  = LV_IMAGE_HEADER_MAGIC;
+                    s_png_dsc.header.cf     = LV_COLOR_FORMAT_ARGB8888;
+                    s_png_dsc.header.w      = w;
+                    s_png_dsc.header.h      = h;
+                    s_png_dsc.header.stride = w * 4;
+                    s_png_dsc.data          = px;
+                    s_png_dsc.data_size     = (uint32_t)w * h * 4;
+                    lv_obj_t* img = lv_img_create(s_sprite_layer);
+                    lv_img_set_src(img, &s_png_dsc);
+                    lv_obj_center(img);
+                } else if (px) {
+                    lv_free(px);                                 // decode failed → fall back to dial
+                }
+            } else if (enc) {
+                lv_free(enc);
+            }
         }
     }
 }
 
 /* ---------------------------------------------------------------------------
- * Internal timer: reload sprite whenever DeviceSettings.activeSprite changes.
+ * Raw RGB565 full-screen streaming — the no-PSRAM artwork path.
+ * The Mac pre-renders a 240x240 RGB565 frame and uploads it as a .rgb565
+ * sprite. We stream it from flash to the LCD in 16-row strips through LVGL's
+ * own TFT_eSPI instance (borrowed from the display driver_data), so the full
+ * frame never lives in RAM. LVGL is paused via s_raw_image while it shows.
  * -------------------------------------------------------------------------*/
-static void sprite_refresh_handler(lv_timer_t* /*t*/) {
-    static String last_sprite;
-    const String& active = DeviceSettings::getInstance().activeSprite;
-    if (active != last_sprite) {
-        last_sprite = active;
-        lcd_show_sprite(active);
+static TFT_eSPI* lvgl_tft() {
+    lv_display_t* disp = lv_display_get_default();
+    if (!disp) return nullptr;
+    void* dd = lv_display_get_driver_data(disp);   // lv_tft_espi_t = { TFT_eSPI* tft; }
+    return dd ? *(TFT_eSPI**)dd : nullptr;
+}
+
+static void lcd_stream_rgb565(const String& name) {
+    TFT_eSPI* tft = lvgl_tft();
+    File f = LittleFS.open(SpriteStore::pathFor(name).c_str(), "r");
+    if (!tft || !f) { s_raw_image = false; if (f) f.close(); return; }
+    const int W = TFT_WIDTH, H = TFT_HEIGHT;       // 240 x 240
+    const int ROWS = 16;
+    static uint8_t strip[TFT_WIDTH * 16 * 2];      // one 7.5 KB strip at a time
+    s_raw_image = true;                            // pause LVGL before touching the bus
+    tft->startWrite();
+    tft->setAddrWindow(0, 0, W, H);
+    for (int y = 0; y < H; y += ROWS) {
+        int rows = (y + ROWS <= H) ? ROWS : (H - y);
+        size_t want = (size_t)W * rows * 2;
+        size_t got  = f.read(strip, want);
+        if (got < want) memset(strip + got, 0, want - got);
+        tft->pushColors((uint16_t*)strip, W * rows, true);   // swap byte order for GC9A01
     }
+    tft->endWrite();
+    f.close();
 }
 
 void LcdThread::run() {
@@ -387,8 +439,8 @@ void LcdThread::run() {
     lv_timer_t * animtimer = lv_timer_create(idle_anim_handler, 1500, NULL); // 0.5Hz
     lv_timer_t * postimer = lv_timer_create(counter_handler, 33, NULL); // ~30Hz
     lv_timer_t * lcd_cmd_timer = lv_timer_create(lcd_manager, 1000, NULL); // 1Hz
-    // Poll DeviceSettings.activeSprite for changes and update the sprite widget.
-    lv_timer_t * sprite_timer = lv_timer_create(sprite_refresh_handler, 500, NULL); // 2Hz
+    // (sprite display is polled in the main loop below — not an lv_timer — so the
+    //  raw-image path can pause LVGL without also freezing sprite enter/exit.)
 
     /* 
         Start Timers
@@ -397,7 +449,6 @@ void LcdThread::run() {
     lv_timer_ready(animtimer);
     lv_timer_ready(postimer);
     lv_timer_ready(lcd_cmd_timer);
-    lv_timer_ready(sprite_timer);
 
 
     ui_init(); // Initialize UI
@@ -410,10 +461,25 @@ void LcdThread::run() {
 
     // { "settings": { "deviceOrientation": 2 }}
 
-    while (1) {        
-     
+    String last_sprite;
+    while (1) {
+        // Sprite display lives here (not an lv_timer) so the raw-image path can
+        // pause LVGL. .rgb565 → stream straight to the LCD (no PSRAM); anything
+        // else → the LVGL lv_img/lv_gif path (needs PSRAM); "" → clears to dial.
+        const String& active = DeviceSettings::getInstance().activeSprite;
+        if (active != last_sprite) {
+            last_sprite = active;
+            if (active.endsWith(".rgb565") && SpriteStore::exists(active)) {
+                lcd_stream_rgb565(active);                  // sets s_raw_image = true
+            } else {
+                bool was_raw = s_raw_image;
+                s_raw_image = false;
+                lcd_show_sprite(active);                    // "" clears to the dial
+                if (was_raw) lv_obj_invalidate(lv_screen_active());
+            }
+        }
 
-        lv_timer_handler();
+        if (!s_raw_image) lv_timer_handler();
         lv_tick_inc(10);
         vTaskDelay(1 / portTICK_PERIOD_MS);
     }

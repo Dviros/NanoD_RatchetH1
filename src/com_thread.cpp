@@ -370,6 +370,19 @@ void ComThread::processCommand(JsonDocument& doc, ComThread& self) {
       // Any other value for "reboot" is silently ignored — avoids accidental
       // reboots from future protocol extensions that happen to use the same key.
     }
+
+    // FW8: {"ring":{"primary":<u32>,"secondary":<u32>,"mode":<0-3>}} — transient
+    // album-color LED glow. Pushes a one-off led_config to the HMI thread without
+    // touching the saved profile (it reasserts on the next profile/settings change).
+    v = doc["ring"];
+    if (!v.isNull()) {
+      ledConfig cfg = HapticProfileManager::getInstance().getCurrentProfile()->led_config;
+      cfg.primary_col   = v["primary"]   | cfg.primary_col;
+      cfg.secondary_col = v["secondary"] | cfg.secondary_col;
+      cfg.led_mode      = v["mode"]      | cfg.led_mode;
+      hmi_thread.put_led_config(cfg);
+      self.sendAck("ring", true);
+    }
 }
 
 
