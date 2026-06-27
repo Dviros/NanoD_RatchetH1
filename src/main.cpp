@@ -34,6 +34,10 @@ void setup() {
   snprintf(usb_serial, sizeof(usb_serial), "%012llX", (unsigned long long)ESP.getEfuseMac());
   TinyUSBDevice.setSerialDescriptor(usb_serial);
   //TinyUSBDevice.attach();
+  // 8 KB RX queue (USBCDC default is 256 B). The high-priority USB task drains the
+  // 256 B TinyUSB FIFO into this queue, so a 4 KB binary sprite chunk can't overflow
+  // and drop bytes mid-transfer. Must be set BEFORE begin() (begin keeps a preset queue).
+  Serial.setRxBufferSize(8192);
   Serial.begin(DEFAULT_SERIAL_SPEED);
 
   delay(100);

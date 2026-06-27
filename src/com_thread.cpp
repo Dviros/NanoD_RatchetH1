@@ -107,34 +107,15 @@ void ComThread::run() {
     dispatchSettings();
     dispatchLcdConfig();
     while (true) {
-        // ── Binary sprite receive (fast path) ────────────────────────────────
-        // After {"sprite":{"op":"binbegin",..}} the host streams raw bytes (no
-        // base64/JSON). Drain them straight to flash in big blocks; a normal
-        // {"sprite":{"op":"end",..}} line follows once binRemaining() hits 0.
-        if (SpriteStore::binReceiving()) {
-            static uint8_t binbuf[512];
-            static unsigned long bin_last = 0;
-            if (bin_last == 0) bin_last = millis();
-            // Drain only what's already buffered, yielding between empties so the
-            // TinyUSB task can move incoming USB bytes into the CDC FIFO. A plain
-            // blocking readBytes(want) starves that task → the bytes never arrive.
-            for (int k = 0; k < 200 && SpriteStore::binReceiving(); ++k) {
-                int avail = Serial.available();
-                if (avail <= 0) { vTaskDelay(1); continue; }
-                size_t want = SpriteStore::binRemaining();
-                if ((size_t)avail < want) want = (size_t)avail;
-                if (want > sizeof(binbuf)) want = sizeof(binbuf);
-                size_t n = Serial.readBytes(binbuf, want);   // bytes are present → no block
-                if (n) { SpriteStore::binFeed(binbuf, n); ts_last_activity = millis(); bin_last = millis(); }
-            }
-            if (SpriteStore::binReceiving() && millis() - bin_last > 3000) {
-                SpriteStore::binAbort();                     // stalled host → recover
-                sendError("binary upload timeout", "aborted");
-            }
-            if (!SpriteStore::binReceiving()) bin_last = 0;  // reset window for next upload
-        }
         // ── Serial input path (line / JSON) ──────────────────────────────────
-        else if (Serial.available()) {
+        // Binary sprite upload is chunk-acked: {"sprite":{"op":"binchunk","len":L}}
+        // is followed by exactly L raw bytes. We read them into RAM (fast, no flash
+        // → the 256 B CDC FIFO can't overflow), commit the whole chunk to flash in
+        // one write while the host waits, then ack. Reads and flash writes never
+        // overlap, and the host has no USB OUT in flight during a flash op — so a
+        // slow LittleFS write can't make macOS time out and silently drop bytes
+        // (a single s.write flood lost ~5% exactly that way).
+        if (Serial.available()) {
             JsonDocument doc;
             String input = Serial.readStringUntil('\n');
             DeserializationError error = deserializeJson(doc, input);
@@ -143,7 +124,36 @@ void ComThread::run() {
                 sendError("JSON parse error", error.c_str());
             } else {
                 ts_last_activity = millis();
-                processCommand(doc, *this);
+                JsonObjectConst sp = doc["sprite"];
+                if (!sp.isNull() && strcmp(sp["op"] | "", "binchunk") == 0) {
+                    size_t len = (size_t)(sp["len"] | 0);
+                    static uint8_t cbuf[4096];
+                    bool   rcv = SpriteStore::binReceiving();
+                    size_t got = 0;
+                    bool   ok  = false;
+                    if (rcv && len > 0 && len <= sizeof(cbuf)) {
+                        // Drain exactly len raw bytes into RAM (no flash here → the
+                        // 256 B FIFO can't overflow); batched avail-reads keep up,
+                        // yield only while waiting so a stalled host can't spin core 0.
+                        unsigned long t0 = millis();
+                        while (got < len && millis() - t0 < 800) {
+                            size_t n = Serial.read(cbuf + got, len - got);  // bulk queue read
+                            if (n) { got += n; t0 = millis(); }
+                            else taskYIELD();
+                        }
+                        ok = (got == len) && SpriteStore::binFeed(cbuf, len);  // 1 flash write, host idle
+                    }
+                    if (!ok) SpriteStore::binAbort();
+                    JsonDocument a;
+                    a["binack"]["rd"]  = (uint32_t)(ok ? SpriteStore::binWritten() : 0);
+                    a["binack"]["ok"]  = ok;
+                    a["binack"]["got"] = (uint32_t)got;
+                    a["binack"]["len"] = (uint32_t)len;
+                    a["binack"]["rcv"] = rcv;
+                    String f; serializeJson(a, f); emit(f);
+                } else {
+                    processCommand(doc, *this);
+                }
             }
         }
 

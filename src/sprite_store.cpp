@@ -524,4 +524,6 @@ bool binFeed(const uint8_t* buf, size_t len) {
     return true;
 }
 
+size_t binWritten() { return g_upload.active ? g_upload.written : 0; }
+
 } // namespace SpriteStore
