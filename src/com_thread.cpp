@@ -11,7 +11,7 @@
 #include "./sprite_store.h"
 // FW7: reboot + bootloader-download-mode support
 #include <esp_system.h>   // esp_restart()
-#include <soc/rtc_cntl_reg.h>  // REG_WRITE, RTC_CNTL_OPTION1_REG for force-download-boot
+#include "esp32-hal-tinyusb.h"  // usb_persist_restart(RESTART_BOOTLOADER) — native-USB download entry
 
 
 
@@ -360,14 +360,12 @@ void ComThread::processCommand(JsonDocument& doc, ComThread& self) {
       } else if (v.is<String>() && v.as<String>() == "bootloader") {
         self.sendAck("reboot", true);
         vTaskDelay(pdMS_TO_TICKS(20)); // let ACK flush before reset
-        // Set the ROM force-download-boot flag in RTC slow memory.
-        // REG_WRITE/REG_READ are IDF macros for volatile MMIO access.
-        // RTC_CNTL_FORCE_DOWNLOAD_BOOT (BIT(0) of RTC_CNTL_OPTION1_REG) is
-        // the documented bit the ROM checks on every reset to decide whether to
-        // enter UART download mode (same path as the DTR/RTS esptool dance).
-        REG_WRITE(RTC_CNTL_OPTION1_REG,
-                  REG_READ(RTC_CNTL_OPTION1_REG) | RTC_CNTL_FORCE_DOWNLOAD_BOOT);
-        esp_restart();
+        // Restart into ROM download mode with USB kept enumerated. This is the
+        // exact call the Arduino USB-CDC stack makes on esptool's DTR/RTS dance
+        // (USBCDC.cpp). It sets the USB persist flags so the native USB survives
+        // the reset and re-enumerates as the ROM downloader — REG_WRITE +
+        // esp_restart drops USB and wedges the device on native-USB S3 boards.
+        usb_persist_restart(RESTART_BOOTLOADER);
       }
       // Any other value for "reboot" is silently ignored — avoids accidental
       // reboots from future protocol extensions that happen to use the same key.
