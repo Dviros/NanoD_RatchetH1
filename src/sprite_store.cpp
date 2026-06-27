@@ -47,6 +47,7 @@ namespace {
 
 struct UploadCtx {
     bool     active   = false;
+    bool     binary   = false; // raw-byte fast path (binbegin/binend) vs base64 data
     String   name;
     size_t   expected = 0;   // declared size in "begin"
     size_t   written  = 0;   // bytes written so far
@@ -216,6 +217,7 @@ static bool handle_begin(JsonObjectConst cmd, String& err) {
     if (!g_upload.file) { err = "cannot open file"; return false; }
 
     g_upload.active   = true;
+    g_upload.binary   = false;
     g_upload.name     = String(name);
     g_upload.expected = size;
     g_upload.written  = 0;
@@ -223,6 +225,19 @@ static bool handle_begin(JsonObjectConst cmd, String& err) {
     g_upload.crc_run  = 0;
     return true;
 }
+
+// ── Binary fast path: binbegin opens the file (reusing handle_begin), then raw
+//    bytes stream straight to flash via binFeed (no base64/JSON per chunk), then
+//    binend validates via handle_end. ~10x faster than the base64 data path.
+
+static bool handle_binbegin(JsonObjectConst cmd, String& err) {
+    if (!handle_begin(cmd, err)) return false;
+    g_upload.binary = true;
+    return true;
+}
+
+// binReceiving / binRemaining / binFeed are defined in the SpriteStore namespace
+// block below (they're public; the helpers above are file-local).
 
 static bool handle_data(JsonObjectConst cmd, String& err) {
     if (!g_upload.active) { err = "no active upload"; return false; }
@@ -450,8 +465,9 @@ bool handleCommand(JsonObjectConst cmd, String& err) {
     const char* op = cmd["op"] | "";
 
     if (strcmp(op, "begin") == 0)  return handle_begin(cmd, err);
+    if (strcmp(op, "binbegin")==0) return handle_binbegin(cmd, err);
     if (strcmp(op, "data")  == 0)  return handle_data(cmd, err);
-    if (strcmp(op, "end")   == 0)  return handle_end(cmd, err);
+    if (strcmp(op, "end")   == 0)  return handle_end(cmd, err);  // also finalizes binary uploads
     if (strcmp(op, "delete")== 0)  return handle_delete(cmd, err);
     if (strcmp(op, "list")  == 0)  return handle_list(err);   // names in err
     if (strcmp(op, "select")== 0)  return handle_select(cmd, err);
@@ -485,6 +501,27 @@ String pathFor(const String& name) {
 
 bool exists(const String& name) {
     return LittleFS.exists(pathFor(name).c_str());
+}
+
+bool binReceiving() { return g_upload.active && g_upload.binary; }
+
+void binAbort() { abort_upload(); }   // recover from a stalled/interrupted binary upload
+
+size_t binRemaining() {
+    return (g_upload.active && g_upload.expected > g_upload.written)
+           ? (g_upload.expected - g_upload.written) : 0;
+}
+
+bool binFeed(const uint8_t* buf, size_t len) {
+    if (!g_upload.active || !g_upload.binary) return false;
+    if (g_upload.written + len > g_upload.expected)
+        len = g_upload.expected - g_upload.written;     // never overrun declared size
+    if (len == 0) return true;
+    size_t wrote = g_upload.file.write(buf, len);
+    if (wrote != len) { abort_upload(); return false; } // disk full → abort
+    g_upload.crc_run = crc32_update(g_upload.crc_run, buf, len);
+    g_upload.written += len;
+    return true;
 }
 
 } // namespace SpriteStore

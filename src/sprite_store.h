@@ -78,4 +78,15 @@ namespace SpriteStore {
      */
     void listJson(JsonArray arr);
 
+    /**
+     * Binary fast-path upload: after a {"sprite":{"op":"binbegin",...}} the host
+     * streams raw bytes (no base64/JSON). The com thread, between line reads,
+     * polls binReceiving() and feeds raw bytes via binFeed() until binRemaining()
+     * hits 0; a normal {"sprite":{"op":"end","crc32":..}} then validates.
+     */
+    bool   binReceiving();
+    size_t binRemaining();
+    bool   binFeed(const uint8_t* buf, size_t len);
+    void   binAbort();   // abort a stalled/interrupted binary upload (com-thread timeout)
+
 } // namespace SpriteStore

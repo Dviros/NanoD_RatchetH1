@@ -107,8 +107,34 @@ void ComThread::run() {
     dispatchSettings();
     dispatchLcdConfig();
     while (true) {
-        // ── Serial input path ────────────────────────────────────────────────
-        if (Serial.available()) {
+        // ── Binary sprite receive (fast path) ────────────────────────────────
+        // After {"sprite":{"op":"binbegin",..}} the host streams raw bytes (no
+        // base64/JSON). Drain them straight to flash in big blocks; a normal
+        // {"sprite":{"op":"end",..}} line follows once binRemaining() hits 0.
+        if (SpriteStore::binReceiving()) {
+            static uint8_t binbuf[512];
+            static unsigned long bin_last = 0;
+            if (bin_last == 0) bin_last = millis();
+            // Drain only what's already buffered, yielding between empties so the
+            // TinyUSB task can move incoming USB bytes into the CDC FIFO. A plain
+            // blocking readBytes(want) starves that task → the bytes never arrive.
+            for (int k = 0; k < 200 && SpriteStore::binReceiving(); ++k) {
+                int avail = Serial.available();
+                if (avail <= 0) { vTaskDelay(1); continue; }
+                size_t want = SpriteStore::binRemaining();
+                if ((size_t)avail < want) want = (size_t)avail;
+                if (want > sizeof(binbuf)) want = sizeof(binbuf);
+                size_t n = Serial.readBytes(binbuf, want);   // bytes are present → no block
+                if (n) { SpriteStore::binFeed(binbuf, n); ts_last_activity = millis(); bin_last = millis(); }
+            }
+            if (SpriteStore::binReceiving() && millis() - bin_last > 3000) {
+                SpriteStore::binAbort();                     // stalled host → recover
+                sendError("binary upload timeout", "aborted");
+            }
+            if (!SpriteStore::binReceiving()) bin_last = 0;  // reset window for next upload
+        }
+        // ── Serial input path (line / JSON) ──────────────────────────────────
+        else if (Serial.available()) {
             JsonDocument doc;
             String input = Serial.readStringUntil('\n');
             DeserializationError error = deserializeJson(doc, input);
