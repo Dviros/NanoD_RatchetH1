@@ -2,6 +2,7 @@
 #include "lcd_thread.h"
 #include "sprite_store.h"    // SpriteStore::pathFor, SpriteStore::exists
 #include "DeviceSettings.h"  // DeviceSettings::getInstance().activeSprite
+#include <LittleFS.h>        // read sprite bytes into RAM for the in-memory PNG decode path
 
 // TODO: See if can do it more elegantly from LVGL tfteSPI driver
 #include <TFT_eSPI.h>
@@ -25,6 +26,13 @@ static lv_obj_t* s_gif_obj = nullptr;
 // Full-screen opaque layer that hosts the active sprite ON TOP of everything,
 // so a sprite REPLACES the dial view instead of overlaying it. Null = dial shown.
 static lv_obj_t* s_sprite_layer = nullptr;
+// PNG source buffer: LVGL's lodepng decoder_open() loads file sources via C
+// fopen() (lodepng_load_file), which CANNOT read our LittleFS "L:" virtual
+// drive — decoder_info succeeds (it uses lv_fs) but decoder_open fails, leaving
+// a black layer. We read the bytes ourselves and pass an in-memory (VARIABLE)
+// source instead. The buffer must outlive the lv_img that references it.
+static uint8_t*       s_png_buf = nullptr;
+static lv_image_dsc_t s_png_dsc;
 
 
 // TODO: Move to PIO Build Flags
@@ -258,6 +266,8 @@ void lcd_show_sprite(const String& name) {
         s_sprite_layer = nullptr;
         s_gif_obj      = nullptr;
     }
+    // Free the previous PNG source buffer (kept alive while its lv_img existed).
+    if (s_png_buf) { lv_free(s_png_buf); s_png_buf = nullptr; }
     // Hide the legacy in-screen sprite widget — we no longer draw onto the dial.
     if (ui_spriteImg) lv_obj_add_flag(ui_spriteImg, LV_OBJ_FLAG_HIDDEN);
 
@@ -303,9 +313,28 @@ void lcd_show_sprite(const String& name) {
         }
 #endif
     } else {
-        lv_obj_t* img = lv_img_create(s_sprite_layer);
-        lv_img_set_src(img, lvPath.c_str());
-        lv_obj_center(img);
+        // Static image (.png/.bmp). Load the file into RAM and decode from an
+        // in-memory (VARIABLE) source — see s_png_buf note above for why the
+        // plain "L:<path>" file source renders black with lodepng.
+        String fsPath = SpriteStore::pathFor(name);
+        File fp = LittleFS.open(fsPath.c_str(), "r");
+        if (fp) {
+            size_t sz = fp.size();
+            s_png_buf = (uint8_t*)lv_malloc(sz);
+            if (s_png_buf && fp.read(s_png_buf, sz) == sz) {
+                lv_memzero(&s_png_dsc, sizeof(s_png_dsc));
+                s_png_dsc.header.magic = LV_IMAGE_HEADER_MAGIC; // mark as a real image descriptor
+                s_png_dsc.header.cf    = LV_COLOR_FORMAT_RAW;   // encoded bytes; lodepng decodes
+                s_png_dsc.data         = s_png_buf;
+                s_png_dsc.data_size    = sz;
+                lv_obj_t* img = lv_img_create(s_sprite_layer);
+                lv_img_set_src(img, &s_png_dsc);
+                lv_obj_center(img);
+            } else if (s_png_buf) {
+                lv_free(s_png_buf); s_png_buf = nullptr;   // alloc or short read → fall back to dial
+            }
+            fp.close();
+        }
     }
 }
 
