@@ -95,6 +95,11 @@ void WifiThread::loop() {
             // persist — power-save stayed on (ping RTT ~100ms). Setting it here,
             // after every established connection, drops RTT to <5ms.
             WiFi.setSleep(false);
+            // Cap RF TX power: full 19.5dBm bursts ~300mA on the shared 5V rail
+            // (1uF VBUS bulk — schematic) — spikes corrupt RMT/ISR timing under
+            // simultaneous motor load. 11dBm halves burst current; desk-range
+            // link (same room as the host) loses nothing.
+            WiFi.setTxPower(WIFI_POWER_11dBm);
         }
         ArduinoOTA.handle();
 

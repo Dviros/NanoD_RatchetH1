@@ -22,6 +22,10 @@
 #define PIN_NANO_I2C_SDA 12
 #define PIN_NANO_I2C_SCL 13
 
+// USB-PD controller hard-reset (STUSB4500 PD_RESET, active-high, R17 pulldown -> GPIO15).
+// Pulsing it reloads NVM + re-runs PD negotiation — the datasheet "re-plug" equivalent.
+#define PIN_PD_RESET 15
+
 // Smart LED (WS2811)
 #define PIN_LED_A 38
 #define PIN_LED_B 42

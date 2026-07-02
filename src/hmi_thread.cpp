@@ -147,6 +147,16 @@ bool HmiThread::get_key_event(KeyEvt* keyEvt){
 
 
 
+// Liveness heartbeat: the HMI loop stamps this every iteration. The com thread watches
+// it and force-restarts if the LED render loop ever stalls (e.g. a FastLED RMT hang)
+// for >5 s, so the device self-recovers instead of freezing forever.
+volatile uint32_t g_hmi_beat = 0;
+// PD diagnostic: raw RDO bytes + both byte-order decodes, surfaced via {"pd":"status"}
+// so we can see the *actual* negotiated PDO instead of trusting one unverified byte order.
+volatile uint8_t g_pd_rdo[4] = {0, 0, 0, 0};
+volatile uint8_t g_pd_sel_hi = 0, g_pd_sel_lo = 0;
+volatile uint8_t g_pd_cc_adv = 0;   // Type-C CC advertisement: 0=default 1=1.5A 2=3.0A
+
 void HmiThread::run() {
     // Fix 3: recursive mutex guards keyState, currentValue and any shared HMI state.
     // Created here (before ISR callbacks can fire) so it is valid for the full thread lifetime.
@@ -156,6 +166,20 @@ void HmiThread::run() {
     FastLED.addLeds<LED_CHIPSET, PIN_LED_A, RGB>(leds, NANO_LED_A_NUM);
     FastLED.addLeds<LED_CHIPSET, PIN_LED_B, LED_COL_ORDER>(ledsp, NANO_LED_B_NUM);
     FastLED.setBrightness( DEFAULT_LED_MAX_BRIGHTNESS );
+    // Power-budget the LEDs. 60+8 WS2812 unbounded can pull >2A — more than the motor —
+    // on a rail with only 1uF VBUS bulk (schematic). Reserve ~2W system (ESP+LCD) and
+    // ~3W motor from the negotiated supply budget; the LEDs get the rest, floored at
+    // 250mA (still clearly visible) and capped at 1200mA. FastLED scales output
+    // dynamically to hold the cap, so this is invisible until the budget is exceeded.
+    {
+        uint32_t supply_ma = DeviceSettings::getInstance().pdBudgetMa;
+        float    pdv       = DeviceSettings::getInstance().getPdVoltage();
+        int32_t  led_mw    = (int32_t)(supply_ma * pdv) - 2000 - 3000;
+        uint16_t led_ma    = (uint16_t)constrain(led_mw / 5, (int32_t)250, (int32_t)1200);
+        FastLED.setMaxPowerInVoltsAndMilliamps(5, led_ma);
+        Serial.printf("LED power cap: %umA @5V (supply budget %lumA @%.1fV)\n",
+                      led_ma, (unsigned long)supply_ma, pdv);
+    }
     pinMode(PIN_BTN_A, INPUT_PULLUP);
     pinMode(PIN_BTN_B, INPUT_PULLUP);
     pinMode(PIN_BTN_C, INPUT_PULLUP);
@@ -194,6 +218,7 @@ void HmiThread::run() {
 
     audio_play(SOUND_CHIME); // startup chime – no-op if NANO_AUDIO=0
     while (1) {
+        g_hmi_beat = millis();   // liveness stamp (before the LED show that can hang)
         handleSettings();
         handleConfig();
         handleMidi();
@@ -502,9 +527,16 @@ void HmiThread::updateLeds() {
     uint16_t end_pos = foc_thread.pass_end_pos();
     uint8_t device_orientation = DeviceSettings::getInstance().deviceOrientation;
     uint8_t led_orientation = map(device_orientation, 0, 3, 0, 135);
-    uint16_t point = map(cur_pos, end_pos, start_pos, 0, NANO_LED_A_NUM - 1);
-    uint16_t start = map(start_pos, end_pos, start_pos, 0, NANO_LED_A_NUM - 1);
-    uint16_t end = map(end_pos, end_pos, start_pos, 0, NANO_LED_A_NUM - 1);
+    uint16_t point, start, end;
+    if (start_pos == end_pos) {
+        // Degenerate/free-spin profile: map()'s divisor (in_max-in_min) would be 0 —
+        // integer divide-by-zero panics the ESP32. Render a full ring instead.
+        point = 0; start = 0; end = NANO_LED_A_NUM - 1;
+    } else {
+        point = map(cur_pos, end_pos, start_pos, 0, NANO_LED_A_NUM - 1);
+        start = map(start_pos, end_pos, start_pos, 0, NANO_LED_A_NUM - 1);
+        end   = map(end_pos, end_pos, start_pos, 0, NANO_LED_A_NUM - 1);
+    }
 
 
     // Knob-turning detector: while moving show volume (pointer); when still and a
@@ -515,7 +547,15 @@ void HmiThread::updateLeds() {
     bool turning = (millis() - led_pos_ts < 1000);
     bool cover   = DeviceSettings::getInstance().getActiveSprite().endsWith(".rgb565");
 
-    if (cover && !turning) {
+    if (cover && turning) {
+        // Music + turning the knob: show the VOLUME level as a bright partial arc with
+        // a dim remainder (a real volume meter), so it's clearly distinct from the full
+        // idle album glow. Same ring geometry as the seek arc; derived from `point`.
+        int vol_permille = constrain(1000 - (point * 1000) / (NANO_LED_A_NUM - 1), 0, 1000);
+        seekRing(vol_permille, CRGB(led_config.primary_col), led_orientation);
+        updateKeyLeds();
+        FastLED.setBrightness(min(led_max_brightness, led_config.led_brightness));
+    } else if (cover && !turning) {
         // Music idle: song-progress bar on the ring, album color (no R/G/B cycle).
         seekRing(DeviceSettings::getInstance().seekPermille, CRGB(led_config.primary_col), led_orientation);
         updateKeyLeds();
@@ -649,6 +689,19 @@ PowerType HmiThread::init_pd() {
         // 1000 ms settle delay gives the PD re-negotiation window enough time.
         usb_pd.softReset();
         delay(1000); // allow re-negotiation to complete
+
+        // Datasheet-correct NVM apply: hard-reset the STUSB4500 so it reloads the
+        // freshly-written NVM and re-runs negotiation from it (softReset() renegotiates
+        // but does NOT reload NVM). Schematic: PD_RESET (active-high, R17 10k pulldown)
+        // <- ESP32 GPIO15. CAUTION: while the STUSB resets it releases SNK_VBUS_EN, so
+        // Q2 un-gates Vmot and the ESP32 (powered from Vmot via U9) may power-cycle
+        // itself — same effect as the datasheet's "re-plug after NVM flash". Runs at
+        // most once per NVM change (needsProgram guards it), so no boot loop.
+        pinMode(PIN_PD_RESET, OUTPUT);
+        digitalWrite(PIN_PD_RESET, HIGH);
+        delay(15);
+        digitalWrite(PIN_PD_RESET, LOW);
+        delay(1000); // NVM reload + renegotiation window (if we kept power)
     }
 
     // Fix 2d: read the selected PDO voltage; PDO1=5V is always the fallback per our NVM config.
@@ -665,6 +718,11 @@ PowerType HmiThread::init_pd() {
             uint8_t b1 = Wire.read();
             uint8_t b2 = Wire.read();
             uint8_t b3 = Wire.read();
+            // Stash the raw RDO + both byte-order decodes for the {"pd":"status"}
+            // diagnostic so the actual negotiated PDO can be confirmed empirically.
+            g_pd_rdo[0] = b0; g_pd_rdo[1] = b1; g_pd_rdo[2] = b2; g_pd_rdo[3] = b3;
+            g_pd_sel_hi = (b3 >> 4) & 0x07;
+            g_pd_sel_lo = (b0 >> 4) & 0x07;
             // RDO object position is in bits [30:28] of the 32-bit register (big-endian).
             // See docs/KNOWN_RESIDUALS.md — byte ordering unverified on hardware; use
             // -DPD_RDO_ALT_BYTE to test big-endian first byte (b0) instead of b3.
@@ -676,6 +734,23 @@ PowerType HmiThread::init_pd() {
             if (selected_pdo == 0) selected_pdo = 1; // 0 means no contract yet
         }
     }
+
+    // Type-C CC current advertisement — works WITHOUT a PD contract (e.g. through a
+    // non-PD hub, RDO stays 0 but the source still advertises via its CC pull-up).
+    // CC_STATUS reg 0x11: bits[1:0]=CC1, bits[3:2]=CC2 → 0=default(500/900mA),
+    // 1=1.5A, 2=3.0A. This is the honest supply budget when no contract formed.
+    uint8_t cc_adv = 0;
+    Wire.beginTransmission(0x28);
+    Wire.write(0x11);
+    if (Wire.endTransmission(false) == 0 &&
+        Wire.requestFrom((uint8_t)0x28, (uint8_t)1) == 1) {
+        uint8_t cc = Wire.read();
+        uint8_t a = cc & 0x03, b = (cc >> 2) & 0x03;
+        cc_adv = (a > b) ? a : b;
+        if (cc_adv > 2) cc_adv = 0; // 3 = reserved
+    }
+    g_pd_cc_adv = cc_adv;
+    bool have_contract = (g_pd_rdo[0] | g_pd_rdo[1] | g_pd_rdo[2] | g_pd_rdo[3]) != 0;
 
     float negotiated_v = usb_pd.getVoltage(selected_pdo);
     float negotiated_i = usb_pd.getCurrent(selected_pdo);
@@ -690,11 +765,24 @@ PowerType HmiThread::init_pd() {
         negotiated_i = 0.9f; // guard: library returns 0 for PDO1 on some NVM states
     }
 
+    // Supply budget (mA at VBUS): contract current when a PD contract exists, else the
+    // CC advertisement. FOC (motor limit) and HMI (LED power cap) budget from this.
+    uint32_t budget_ma;
+    if (have_contract) {
+        budget_ma = (uint32_t)(negotiated_i * 1000.0f);
+    } else {
+        budget_ma = (cc_adv == 2) ? 3000 : (cc_adv == 1) ? 1500 : 900;
+        negotiated_i = budget_ma / 1000.0f; // report the advertised budget, not NVM wishes
+    }
+
     // Store into DeviceSettings so foc_thread can consume voltage before motor init.
     DeviceSettings::getInstance().setPdVoltage(negotiated_v);
+    DeviceSettings::getInstance().pdBudgetMa = budget_ma;
     // Store current so com_thread can serve {"pd":"?"} queries.
     _pd_negotiated_current = negotiated_i;
-    Serial.printf("PD negotiated: PDO%d = %.1fV / %.2fA\n", selected_pdo, negotiated_v, negotiated_i);
+    Serial.printf("PD: contract=%d PDO%d %.1fV cc_adv=%d -> budget %lumA\n",
+                  (int)have_contract, selected_pdo, negotiated_v, cc_adv,
+                  (unsigned long)budget_ma);
 
     if (negotiated_v >= 9.0f) return POWER_9V_PD;
     if (negotiated_v > 5.0f)  return POWER_5V_PD; // 6/7/8V variants possible

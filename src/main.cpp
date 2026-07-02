@@ -21,19 +21,21 @@ ComThread com_thread(0);
 
 void setup() {
 
-  // initialize USB
-  TinyUSBDevice.begin();
-  hmi_thread.init_usb();
-  TinyUSBDevice.setID(USB_VID, USB_PID);
-  TinyUSBDevice.setProductDescriptor(USB_PRODUCT);
-  TinyUSBDevice.setManufacturerDescriptor(USB_MANUFACTURER);
+  // initialize USB — descriptors MUST be set BEFORE begin(): begin() starts
+  // enumeration, and the host reads descriptors immediately; late setID/set*
+  // calls lose the race (device showed Espressif default VID/PID 0x303A/0x1001
+  // instead of the configured ones).
   // Per-device USB serial = eFuse MAC (read directly; DeviceSettings isn't up yet).
   // A unique serial lets macOS/Windows assign stable, distinct ports per unit and
   // lets the app tell two knobs apart. (Was the constant "Nano_D".)
   static char usb_serial[13];
   snprintf(usb_serial, sizeof(usb_serial), "%012llX", (unsigned long long)ESP.getEfuseMac());
+  TinyUSBDevice.setID(USB_VID, USB_PID);
+  TinyUSBDevice.setProductDescriptor(USB_PRODUCT);
+  TinyUSBDevice.setManufacturerDescriptor(USB_MANUFACTURER);
   TinyUSBDevice.setSerialDescriptor(usb_serial);
-  //TinyUSBDevice.attach();
+  TinyUSBDevice.begin();
+  hmi_thread.init_usb();
   // 8 KB RX queue (USBCDC default is 256 B). The high-priority USB task drains the
   // 256 B TinyUSB FIFO into this queue, so a 4 KB binary sprite chunk can't overflow
   // and drop bytes mid-transfer. Must be set BEFORE begin() (begin keeps a preset queue).

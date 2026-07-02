@@ -169,6 +169,11 @@ public:
     uint32_t musicColor   = 0x08596C;   // album color for volume/seek arcs (0xRRGGBB)
     int32_t  seekPermille = -1;         // song progress 0..1000; -1 = hide seek arc
 
+    // Supply current budget in mA at VBUS, set once by init_pd() before threads start
+    // (PD contract current, else the Type-C CC advertisement). Runtime-only — not
+    // persisted. FOC (motor current limit) and HMI (LED power cap) budget from this.
+    uint32_t pdBudgetMa   = 900;        // conservative USB3 default
+
     // Network PSK — internal only; never serialise plaintext; use getNetPsk()
     String netPsk;
 

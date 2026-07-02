@@ -10,8 +10,24 @@
 #include "./wifi_thread.h"
 #include "./sprite_store.h"
 // FW7: reboot + bootloader-download-mode support
-#include <esp_system.h>   // esp_restart()
+#include <esp_system.h>   // esp_restart(), esp_reset_reason()
 #include "esp32-hal-tinyusb.h"  // usb_persist_restart(RESTART_BOOTLOADER) — native-USB download entry
+
+// Map esp_reset_reason() to a short label for the {"boot"} diagnostic frame.
+static const char* boot_reason_str(int r) {
+    switch (r) {
+        case ESP_RST_POWERON:   return "POWERON";
+        case ESP_RST_SW:        return "SW";        // esp_restart() — our reboot / flash
+        case ESP_RST_PANIC:     return "PANIC";     // crash / exception (firmware bug)
+        case ESP_RST_INT_WDT:   return "INT_WDT";   // interrupt watchdog
+        case ESP_RST_TASK_WDT:  return "TASK_WDT";  // a task blocked too long
+        case ESP_RST_WDT:       return "WDT";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT";  // supply dipped — e.g. motor torque spike
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_EXT:       return "EXT";
+        default:                return "OTHER";
+    }
+}
 
 
 
@@ -176,11 +192,92 @@ void ComThread::run() {
             }
         }
 
+        // Self-heal an abandoned sprite upload (e.g. the bridge restarted mid-transfer):
+        // without this, binReceiving() stays true forever, parking the motor and
+        // freezing the haptic loop / LED ring. Aborts after a 2 s stall.
+        SpriteStore::binWatchdog();
+
+        // HMI/LED-thread liveness telemetry (DIAGNOSTIC ONLY — does NOT restart, so it can
+        // never crash-loop). The HMI loop stamps g_hmi_beat each iteration; if the LED render
+        // stalls >5 s we emit one {"fault":"hmi_stall"} line so it's visible in the log. The
+        // real anti-hang fix is the bounded-wait patch in the FastLED RMT driver (show() no
+        // longer blocks forever), so this should never actually fire.
+        {
+            extern volatile uint32_t g_hmi_beat;
+            static bool hmi_seen = false, fault_sent = false;
+            uint32_t beat = g_hmi_beat;
+            if (beat != 0) hmi_seen = true;
+            if (hmi_seen && (millis() - beat) > 5000) {
+                if (!fault_sent) {
+                    fault_sent = true;
+                    JsonDocument fd; fd["fault"] = "hmi_stall"; fd["stall_ms"] = (uint32_t)(millis() - beat);
+                    String f; serializeJson(fd, f); emit(f);
+                }
+            } else {
+                fault_sent = false;
+            }
+        }
+
+        // Boot diagnostic: report why we last (re)started + the negotiated PD voltage.
+        // Re-emitted for ~12 s so a host that reconnects after a crash still catches it.
+        {
+            static int boot_reason = -1;
+            static unsigned long boot_t0 = 0, boot_last = 0;
+            if (boot_reason < 0) { boot_reason = (int)esp_reset_reason(); boot_t0 = millis(); }
+            if (millis() - boot_t0 < 12000 && millis() - boot_last > 2000) {
+                boot_last = millis();
+                JsonDocument bd; JsonObject o = bd["boot"].to<JsonObject>();
+                o["reset"]  = boot_reason;
+                o["reason"] = boot_reason_str(boot_reason);
+                o["pd_v"]   = DeviceSettings::getInstance().getPdVoltage();
+                o["budget_ma"] = DeviceSettings::getInstance().pdBudgetMa;
+                String f; serializeJson(bd, f); emit(f);
+            }
+        }
+
         // send any outgoing messages
         handleMessages();
 
         // send key events
         handleEvents();
+
+        // Reliable button input. The HMI/AceButton polling on the shared core 0
+        // intermittently misses presses (the GPIOs respond fine — confirmed by
+        // scope — but events don't fire). The com thread runs reliably (the knob
+        // telemetry proves it), so edge-detect the 4 button pins here and emit
+        // {"kd"}/{"ku"} directly. Pins are already INPUT_PULLUP (set by the HMI).
+        {
+            static const int bpins[4] = {PIN_BTN_A, PIN_BTN_B, PIN_BTN_C, PIN_BTN_D};
+            static int stable[4]  = {1, 1, 1, 1};   // committed (emitted) level
+            static int pend[4]    = {1, 1, 1, 1};   // candidate level being confirmed
+            static unsigned long pendts[4] = {0, 0, 0, 0};
+            static uint8_t bstate = 0;
+            // Confirm-before-emit: a change must HOLD for 30ms before it's committed.
+            // Sub-30ms excursions (contact bounce, supply-dip glitches on these
+            // pullup-only pins — 40/41 JTAG, 45/46 strapping) never emit at all.
+            int commit[4]; int ncommit = 0;
+            for (int i = 0; i < 4; i++) {
+                int v = digitalRead(bpins[i]);
+                if (v != pend[i]) { pend[i] = v; pendts[i] = millis(); }
+                if (pend[i] != stable[i] && millis() - pendts[i] >= 30)
+                    commit[ncommit++] = i;
+            }
+            // Power-glitch veto: a rail sag flips several pins in the same tick —
+            // real fingers don't hit 3+ keys within 10ms. Absorb silently.
+            if (ncommit >= 3) {
+                for (int n = 0; n < ncommit; n++) stable[commit[n]] = pend[commit[n]];
+            } else {
+                for (int n = 0; n < ncommit; n++) {
+                    int i = commit[n];
+                    stable[i] = pend[i];
+                    JsonDocument ed;
+                    if (stable[i] == 0) { bstate |= (1 << i);  ed["ks"] = bstate; ed["kd"] = i; }
+                    else                { bstate &= ~(1 << i); ed["ks"] = bstate; ed["ku"] = i; }
+                    String f; serializeJson(ed, f); emit(f);
+                    ts_last_activity = millis();
+                }
+            }
+        }
 
         // send idle message
         unsigned long now = millis();
@@ -361,6 +458,25 @@ void ComThread::processCommand(JsonDocument& doc, ComThread& self) {
         pdObj["current"] = current;
         pdObj["power"]   = power;
         pdObj["source"]  = source;
+        // Raw RDO diagnostic — verify the ACTUAL negotiated PDO instead of trusting one
+        // unverified byte order. rdo = the 4 raw bytes of reg 0x91; sel_hi=(b3>>4)&7 (LE
+        // MSB), sel_lo=(b0>>4)&7 (alt). The real object position is 1 (=5V) or 2 (=9V) —
+        // whichever decode lands in [1,2] is correct; pdo_sel/v_real are that best guess.
+        extern volatile uint8_t g_pd_rdo[4];
+        extern volatile uint8_t g_pd_sel_hi, g_pd_sel_lo;
+        extern volatile uint8_t g_pd_cc_adv;
+        char rdohex[12];
+        snprintf(rdohex, sizeof(rdohex), "%02X%02X%02X%02X",
+                 g_pd_rdo[0], g_pd_rdo[1], g_pd_rdo[2], g_pd_rdo[3]);
+        uint8_t real_sel = (g_pd_sel_hi >= 1 && g_pd_sel_hi <= 2) ? g_pd_sel_hi
+                         : (g_pd_sel_lo >= 1 && g_pd_sel_lo <= 2) ? g_pd_sel_lo : 1;
+        pdObj["rdo"]     = rdohex;
+        pdObj["sel_hi"]  = g_pd_sel_hi;
+        pdObj["sel_lo"]  = g_pd_sel_lo;
+        pdObj["pdo_sel"] = real_sel;
+        pdObj["v_real"]  = (real_sel == 2) ? 9.0 : 5.0;
+        pdObj["cc_adv"]  = g_pd_cc_adv;   // Type-C advert: 0=default 1=1.5A 2=3.0A
+        pdObj["budget_ma"] = DeviceSettings::getInstance().pdBudgetMa;
         String frame;
         serializeJson(pdDoc, frame);
         self.emit(frame);
@@ -449,45 +565,35 @@ void ComThread::sendAck(const char* cmd, bool ok, const char* errMsg) {
 
 
 void ComThread::handleEvents() {
+    // Buttons are now emitted by the com thread's reliable edge-detect (see run());
+    // just drain the HMI key queue so it doesn't back up — don't double-emit here.
+    { KeyEvt drainEvt; while (hmi_thread.get_key_event(&drainEvt)) {} }
+
+    // COALESCE + THROTTLE the position telemetry. The old code emitted one JSON frame per
+    // FOC angle event — hundreds per second while spinning fast. Each frame is a USB-CDC
+    // write whose ISR runs on core 0 and preempts the FastLED RMT refill ISR; under that
+    // storm the RMT done-interrupt is missed and the LED thread hangs in show() (knob-turn
+    // freeze) or the stuck ISR trips the interrupt watchdog (INT_WDT reset). Draining the
+    // whole queue but emitting only the NEWEST position at <=50 Hz is lossless for volume
+    // and removes the storm at the source.
+    AngleEvt latest; bool hadEvent = false;
+    { AngleEvt e; while (foc_thread.get_angle_event(&e)) { latest = e; hadEvent = true; } }
+    if (!hadEvent) return;
+    ts_last_activity = millis();   // count knob motion as activity even on throttled ticks
+    static unsigned long last_emit = 0;
+    if (millis() - last_emit < 20) return;   // <=50 Hz
+    last_emit = millis();
     JsonDocument eventDoc;
-    bool hadEvent = false;
-    do {
-      KeyEvt keyEvt;
-      hadEvent = hmi_thread.get_key_event(&keyEvt);
-      if (hadEvent) {
-        eventDoc.clear();
-        eventDoc["ks"] = keyEvt.keyState;
-        if (keyEvt.type==0) // AceButton::kEventPressed
-          eventDoc["kd"] = keyEvt.keyNum;
-        else if (keyEvt.type==1) // AceButton::kEventReleased
-          eventDoc["ku"] = keyEvt.keyNum;
-        String frame;
-        serializeJson(eventDoc, frame);
-        emit(frame);
-        ts_last_activity = millis();
-      }
-    } while (hadEvent);
-    do {
-      AngleEvt angleEvt;
-      hadEvent = foc_thread.get_angle_event(&angleEvt);
-      if (hadEvent) {
-        eventDoc.clear();
-        // FW3: emit richer telemetry per communications.md {a,t,v}
-        // "p" is kept for back-compat with older hosts; new hosts should use a/t/v.
-        // a = shaft_angle (rad), t = integer turns, v = velocity (rad/s).
-        float a = foc_thread.get_motor_angle();
-        float v_rad = foc_thread.get_motor_velocity(); // requires FW1 addition
-        int32_t turns = (int32_t)(a / (2.0f * PI));    // integer floor turns from angle
-        eventDoc["p"] = angleEvt.cur_pos;               // legacy uint16 position
-        eventDoc["a"] = a;
-        eventDoc["t"] = turns;
-        eventDoc["v"] = v_rad;
-        String frame;
-        serializeJson(eventDoc, frame);
-        emit(frame);
-        ts_last_activity = millis();
-      }
-    } while (hadEvent);
+    float a = foc_thread.get_motor_angle();
+    float v_rad = foc_thread.get_motor_velocity();
+    int32_t turns = (int32_t)(a / (2.0f * PI));
+    eventDoc["p"] = latest.cur_pos;   // legacy uint16 position (host maps this to volume)
+    eventDoc["a"] = a;
+    eventDoc["t"] = turns;
+    eventDoc["v"] = v_rad;
+    String frame;
+    serializeJson(eventDoc, frame);
+    emit(frame);
 };
 
 

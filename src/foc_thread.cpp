@@ -49,14 +49,24 @@ void FocThread::run() {
         float pdV = DeviceSettings::getInstance().pdVoltage;
         if (pdV < 5.0f || pdV > 9.0f) pdV = 5.0f; // default/safe fallback
         driver.voltage_power_supply = pdV;
-        driver.voltage_limit = pdV; // limit cannot exceed supply
+        // 0.3V margin under the supply: full-duty PWM rides Vmot straight into any sag
+        // (only 1uF VBUS bulk on this board) — margin keeps FOC linear through small dips.
+        driver.voltage_limit = pdV - 0.3f;
     }
 
     driver.init();
     motor.linkSensor(&encoder);
     motor.linkDriver(&driver);
     motor.LPF_velocity.Tf = 0.01f;
-    motor.current_limit = 1.22;
+    // Supply-aware phase-current limit. Full 1.22A haptics need a >=2.5A supply budget
+    // (PD contract or CC 3A advertisement). On weaker ports derate — softer detents,
+    // but no rail collapse (a flat 1.22A dips 5V/900mA ports under torque spikes).
+    {
+        uint32_t ma = DeviceSettings::getInstance().pdBudgetMa;
+        motor.current_limit = (ma >= 2500) ? 1.22f : (ma >= 1400) ? 0.9f : 0.65f;
+        Serial.printf("Motor current limit: %.2fA (supply budget %lumA)\n",
+                      motor.current_limit, (unsigned long)ma);
+    }
     motor.init();
     Direction dir = motor.sensor_direction;
     if (dir == Direction::UNKNOWN) {

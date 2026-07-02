@@ -89,5 +89,6 @@ namespace SpriteStore {
     size_t binWritten();   // bytes committed to flash so far (for chunk acks)
     bool   binFeed(const uint8_t* buf, size_t len);
     void   binAbort();   // abort a stalled/interrupted binary upload (com-thread timeout)
+    void   binWatchdog(); // auto-abort an abandoned upload after a 2 s stall (self-heal)
 
 } // namespace SpriteStore

@@ -54,6 +54,7 @@ struct UploadCtx {
     int      next_seq = 0;   // expected sequence number
     uint32_t crc_run  = 0;   // running CRC-32 accumulator
     File     file;
+    unsigned long last_ms = 0; // millis() of begin/last feed — drives the stall watchdog
 };
 
 UploadCtx g_upload;
@@ -223,6 +224,7 @@ static bool handle_begin(JsonObjectConst cmd, String& err) {
     g_upload.written  = 0;
     g_upload.next_seq = 0;
     g_upload.crc_run  = 0;
+    g_upload.last_ms  = millis();
     return true;
 }
 
@@ -521,9 +523,18 @@ bool binFeed(const uint8_t* buf, size_t len) {
     if (wrote != len) { abort_upload(); return false; } // disk full → abort
     g_upload.crc_run = crc32_update(g_upload.crc_run, buf, len);
     g_upload.written += len;
+    g_upload.last_ms = millis();
     return true;
 }
 
 size_t binWritten() { return g_upload.active ? g_upload.written : 0; }
+
+// Self-heal: if a binary upload stalls (host died right after binbegin, or mid-stream
+// — e.g. the bridge restarted), abort it so binReceiving() clears, the motor un-parks,
+// and the FOC haptic loop resumes. A live upload refreshes last_ms every chunk (~0.3 s),
+// so a 2 s gap means abandoned. Called every com-thread iteration.
+void binWatchdog() {
+    if (g_upload.active && (millis() - g_upload.last_ms) > 2000) abort_upload();
+}
 
 } // namespace SpriteStore
