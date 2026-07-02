@@ -34,6 +34,12 @@ class FocThread : public Thread<FocThread> {
         uint16_t pass_last_pos();
         bool pass_at_limit();
 
+        // Live phase-current-limit override ({"climit":X} command), clamped to
+        // [0.2, 1.22] A. Aligned float store is atomic on Xtensa; the FOC loop reads
+        // it each iteration. For finding the stable 5V ceiling without reflashing.
+        void  set_current_limit(float amps);
+        float get_current_limit();
+
         void setCalibration(MotorCalibration& cal);
 
     protected:

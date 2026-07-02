@@ -58,14 +58,20 @@ void FocThread::run() {
     motor.linkSensor(&encoder);
     motor.linkDriver(&driver);
     motor.LPF_velocity.Tf = 0.01f;
-    // Supply-aware phase-current limit. Full 1.22A haptics need a >=2.5A supply budget
-    // (PD contract or CC 3A advertisement). On weaker ports derate — softer detents,
-    // but no rail collapse (a flat 1.22A dips 5V/900mA ports under torque spikes).
+    // Supply-aware phase-current limit. Empirical (this board, direct 5V/3A port):
+    // 1.22A torque transients dip the 5V rail into INT_WDT territory — only 1.55V of
+    // headroom above the 3V3 LDO dropout, 1uF VBUS bulk, no inrush limiting. At 9V the
+    // 4V headroom absorbs the same transient (the board's own PDO2/POK gating shows
+    // full power was designed for 9V). So: full 1.22A ONLY at 9V; at 5V cap by budget.
     {
-        uint32_t ma = DeviceSettings::getInstance().pdBudgetMa;
-        motor.current_limit = (ma >= 2500) ? 1.22f : (ma >= 1400) ? 0.9f : 0.65f;
-        Serial.printf("Motor current limit: %.2fA (supply budget %lumA)\n",
-                      motor.current_limit, (unsigned long)ma);
+        uint32_t ma  = DeviceSettings::getInstance().pdBudgetMa;
+        float    pdv = DeviceSettings::getInstance().getPdVoltage();
+        if (pdv >= 8.5f)      motor.current_limit = 1.22f;
+        else if (ma >= 2500)  motor.current_limit = 0.9f;
+        else if (ma >= 1400)  motor.current_limit = 0.8f;
+        else                  motor.current_limit = 0.65f;
+        Serial.printf("Motor current limit: %.2fA (%.1fV, budget %lumA)\n",
+                      motor.current_limit, pdv, (unsigned long)ma);
     }
     motor.init();
     Direction dir = motor.sensor_direction;
@@ -160,6 +166,16 @@ uint16_t FocThread::pass_last_pos(){
 
 bool FocThread::pass_at_limit(){
     return haptic.haptic_state.atLimit;
+}
+
+void FocThread::set_current_limit(float amps) {
+    if (amps < 0.2f) amps = 0.2f;
+    if (amps > 1.22f) amps = 1.22f;
+    motor.current_limit = amps;
+}
+
+float FocThread::get_current_limit() {
+    return motor.current_limit;
 }
 
 

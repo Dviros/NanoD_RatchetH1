@@ -495,6 +495,16 @@ void ComThread::processCommand(JsonDocument& doc, ComThread& self) {
       }
     }
 
+    // Live motor phase-current-limit override — {"climit":0.9}. Runtime-only (reverts
+    // to the supply-derived tier on reboot). For binary-searching the stable 5V ceiling
+    // under real hammering without a flash cycle per guess.
+    v = doc["climit"];
+    if (v.is<float>() || v.is<int>()) {
+      foc_thread.set_current_limit(v.as<float>());
+      JsonDocument cd; cd["climit"] = foc_thread.get_current_limit();
+      String f; serializeJson(cd, f); self.emit(f);
+    }
+
     // FW7: reboot commands.
     // {"reboot":true}           → ACK then normal warm restart via esp_restart().
     // {"reboot":"bootloader"}   → ACK then ROM download-mode restart (ESP32-S3).

@@ -175,7 +175,13 @@ void HmiThread::run() {
         uint32_t supply_ma = DeviceSettings::getInstance().pdBudgetMa;
         float    pdv       = DeviceSettings::getInstance().getPdVoltage();
         int32_t  led_mw    = (int32_t)(supply_ma * pdv) - 2000 - 3000;
-        uint16_t led_ma    = (uint16_t)constrain(led_mw / 5, (int32_t)250, (int32_t)1200);
+        // At 5V the limit is TRANSIENT sag, not sustained amps: 1uF VBUS bulk and only
+        // 1.55V of headroom above the 3V3 LDO dropout — a bright ring + motor torque +
+        // flash write stacked up resets the chip even on a 5V/3A PD contract (observed:
+        // crash loop during cover streaming on a direct Mac port). Big LED budgets are
+        // for 9V (4V headroom) only.
+        int32_t  led_max   = (pdv >= 8.5f) ? 1200 : 500;
+        uint16_t led_ma    = (uint16_t)constrain(led_mw / 5, (int32_t)250, led_max);
         FastLED.setMaxPowerInVoltsAndMilliamps(5, led_ma);
         Serial.printf("LED power cap: %umA @5V (supply budget %lumA @%.1fV)\n",
                       led_ma, (unsigned long)supply_ma, pdv);
