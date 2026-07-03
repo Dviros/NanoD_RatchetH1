@@ -48,6 +48,7 @@ namespace {
 struct UploadCtx {
     bool     active   = false;
     bool     binary   = false; // raw-byte fast path (binbegin/binend) vs base64 data
+    bool     ram      = false; // RAM-frame path (rambegin): no flash, no motor park
     String   name;
     size_t   expected = 0;   // declared size in "begin"
     size_t   written  = 0;   // bytes written so far
@@ -58,6 +59,17 @@ struct UploadCtx {
 };
 
 UploadCtx g_upload;
+
+// RAM cover frame — the no-flash artwork path. One 240x240 RGB565 frame lives in
+// internal SRAM; uploads memcpy into it (no LittleFS write -> no cache stall -> the
+// motor keeps its detents through the whole upload). Lazily allocated on the first
+// rambegin; if the alloc fails (e.g. WiFi later re-enabled eats the heap) the host
+// gets an error and falls back to the flash path. g_ram_gen bumps on every
+// completed frame so the LCD re-streams content changes under the same name.
+static uint8_t*          g_ram_frame = nullptr;
+static size_t            g_ram_len   = 0;
+static volatile uint32_t g_ram_gen   = 0;
+static constexpr size_t  RAM_FRAME_MAX = 240 * 240 * 2;   // 115200
 
 // CRC-32 is now provided by include/crc32_util.h (nano_crc32_update).
 // The alias keeps the call-sites below unchanged.
@@ -109,6 +121,7 @@ static void abort_upload() {
             LittleFS.remove(SpriteStore::pathFor(g_upload.name));
         }
         g_upload.active = false;
+        g_upload.ram    = false;   // RAM frame buffer stays allocated; just drop the upload
     }
 }
 
@@ -219,6 +232,7 @@ static bool handle_begin(JsonObjectConst cmd, String& err) {
 
     g_upload.active   = true;
     g_upload.binary   = false;
+    g_upload.ram      = false;
     g_upload.name     = String(name);
     g_upload.expected = size;
     g_upload.written  = 0;
@@ -235,6 +249,30 @@ static bool handle_begin(JsonObjectConst cmd, String& err) {
 static bool handle_binbegin(JsonObjectConst cmd, String& err) {
     if (!handle_begin(cmd, err)) return false;
     g_upload.binary = true;
+    return true;
+}
+
+// RAM-frame upload: same binchunk framing as binbegin, but bytes land in the SRAM
+// cover frame — no flash write, no cache stall, motor stays live. On success the
+// frame auto-displays ("end" bumps the generation + selects the ram sprite name).
+static bool handle_rambegin(JsonObjectConst cmd, String& err) {
+    if (g_upload.active) { err = "upload already active"; return false; }
+    size_t size = cmd["size"] | 0;
+    if (size == 0 || size > RAM_FRAME_MAX) { err = "bad size"; return false; }
+    if (!g_ram_frame) {
+        g_ram_frame = (uint8_t*)heap_caps_malloc(RAM_FRAME_MAX,
+                                                 MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+        if (!g_ram_frame) { err = "no ram"; return false; }   // host falls back to flash
+    }
+    g_upload.active   = true;
+    g_upload.binary   = true;
+    g_upload.ram      = true;
+    g_upload.name     = "ram:cover.rgb565";
+    g_upload.expected = size;
+    g_upload.written  = 0;
+    g_upload.next_seq = 0;
+    g_upload.crc_run  = 0;
+    g_upload.last_ms  = millis();
     return true;
 }
 
@@ -289,6 +327,21 @@ static bool handle_end(JsonObjectConst cmd, String& err) {
     if (!g_upload.active) { err = "no active upload"; return false; }
 
     uint32_t expected_crc = cmd["crc32"] | 0u;
+
+    // RAM-frame finish: validate, then publish (bump the generation so the LCD
+    // re-streams, and select the ram sprite name — direct field write, NOT the
+    // dirty-flagging setter, so a track change never costs a settings flash write).
+    if (g_upload.ram) {
+        bool ok = (g_upload.written == g_upload.expected) &&
+                  (g_upload.crc_run == expected_crc);
+        g_upload.active = false;
+        g_upload.ram    = false;
+        if (!ok) { err = "size/CRC mismatch"; return false; }
+        g_ram_len = g_upload.expected;
+        g_ram_gen = g_ram_gen + 1;
+        DeviceSettings::getInstance().activeSprite = "ram:cover.rgb565";
+        return true;
+    }
 
     g_upload.file.flush();
     g_upload.file.close();
@@ -468,6 +521,7 @@ bool handleCommand(JsonObjectConst cmd, String& err) {
 
     if (strcmp(op, "begin") == 0)  return handle_begin(cmd, err);
     if (strcmp(op, "binbegin")==0) return handle_binbegin(cmd, err);
+    if (strcmp(op, "rambegin")==0) return handle_rambegin(cmd, err);
     if (strcmp(op, "data")  == 0)  return handle_data(cmd, err);
     if (strcmp(op, "end")   == 0)  return handle_end(cmd, err);  // also finalizes binary uploads
     if (strcmp(op, "delete")== 0)  return handle_delete(cmd, err);
@@ -505,7 +559,12 @@ bool exists(const String& name) {
     return LittleFS.exists(pathFor(name).c_str());
 }
 
-bool binReceiving() { return g_upload.active && g_upload.binary; }
+// Any binary upload in flight (com thread's chunk-drain + watchdog gate).
+bool binActive() { return g_upload.active && g_upload.binary; }
+
+// Motor-park signal: ONLY flash-writing uploads stall the cache and need the park.
+// RAM-frame uploads keep full haptics.
+bool binReceiving() { return g_upload.active && g_upload.binary && !g_upload.ram; }
 
 void binAbort() { abort_upload(); }   // recover from a stalled/interrupted binary upload
 
@@ -519,13 +578,23 @@ bool binFeed(const uint8_t* buf, size_t len) {
     if (g_upload.written + len > g_upload.expected)
         len = g_upload.expected - g_upload.written;     // never overrun declared size
     if (len == 0) return true;
-    size_t wrote = g_upload.file.write(buf, len);
-    if (wrote != len) { abort_upload(); return false; } // disk full → abort
+    if (g_upload.ram) {
+        memcpy(g_ram_frame + g_upload.written, buf, len);
+    } else {
+        size_t wrote = g_upload.file.write(buf, len);
+        if (wrote != len) { abort_upload(); return false; } // disk full → abort
+    }
     g_upload.crc_run = crc32_update(g_upload.crc_run, buf, len);
     g_upload.written += len;
     g_upload.last_ms = millis();
     return true;
 }
+
+// RAM cover frame accessors (LCD thread).
+bool           ramValid() { return g_ram_frame != nullptr && g_ram_len > 0; }
+const uint8_t* ramFrame() { return g_ram_frame; }
+size_t         ramLen()   { return g_ram_len; }
+uint32_t       ramGen()   { return g_ram_gen; }
 
 size_t binWritten() { return g_upload.active ? g_upload.written : 0; }
 

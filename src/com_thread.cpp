@@ -143,8 +143,8 @@ void ComThread::run() {
                 JsonObjectConst sp = doc["sprite"];
                 if (!sp.isNull() && strcmp(sp["op"] | "", "binchunk") == 0) {
                     size_t len = (size_t)(sp["len"] | 0);
-                    static uint8_t cbuf[4096];
-                    bool   rcv = SpriteStore::binReceiving();
+                    static uint8_t cbuf[8192];
+                    bool   rcv = SpriteStore::binActive();   // ram OR flash upload
                     size_t got = 0;
                     bool   ok  = false;
                     if (rcv && len > 0 && len <= sizeof(cbuf)) {

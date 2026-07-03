@@ -383,23 +383,43 @@ static TFT_eSPI* lvgl_tft() {
 
 static void lcd_stream_rgb565(const String& name) {
     TFT_eSPI* tft = lvgl_tft();
-    File f = LittleFS.open(SpriteStore::pathFor(name).c_str(), "r");
-    if (!tft || !f) { s_raw_image = false; if (f) f.close(); return; }
+    if (!tft) { s_raw_image = false; return; }
     const int W = TFT_WIDTH, H = TFT_HEIGHT;       // 240 x 240
     const int ROWS = 16;
     static uint8_t strip[TFT_WIDTH * 16 * 2];      // one 7.5 KB strip at a time
+
+    // Source: the SRAM cover frame ("ram:" names — no flash involved at all),
+    // or a LittleFS .rgb565 file (legacy/fallback path).
+    bool from_ram = name.startsWith("ram:");
+    File f;
+    if (from_ram) {
+        if (!SpriteStore::ramValid()) { s_raw_image = false; return; }
+    } else {
+        f = LittleFS.open(SpriteStore::pathFor(name).c_str(), "r");
+        if (!f) { s_raw_image = false; return; }
+    }
+    const uint8_t* src = from_ram ? SpriteStore::ramFrame() : nullptr;
+    size_t src_len = from_ram ? SpriteStore::ramLen() : 0, off = 0;
+
     s_raw_image = true;                            // pause LVGL before touching the bus
     tft->startWrite();
     tft->setAddrWindow(0, 0, W, H);
     for (int y = 0; y < H; y += ROWS) {
         int rows = (y + ROWS <= H) ? ROWS : (H - y);
         size_t want = (size_t)W * rows * 2;
-        size_t got  = f.read(strip, want);
+        size_t got;
+        if (from_ram) {
+            got = (off < src_len) ? min(want, src_len - off) : 0;
+            memcpy(strip, src + off, got);
+            off += got;
+        } else {
+            got = f.read(strip, want);
+        }
         if (got < want) memset(strip + got, 0, want - got);
         tft->pushColors((uint16_t*)strip, W * rows, true);   // swap byte order for GC9A01
     }
     tft->endWrite();
-    f.close();
+    if (f) f.close();
 }
 
 // ── Volume display over the cover ────────────────────────────────────────────
@@ -491,14 +511,20 @@ void LcdThread::run() {
     // { "settings": { "deviceOrientation": 2 }}
 
     String last_sprite;
+    uint32_t last_ram_gen = 0;
     while (1) {
         // Sprite display lives here (not an lv_timer) so the raw-image path can
-        // pause LVGL. .rgb565 → stream straight to the LCD (no PSRAM); anything
-        // else → the LVGL lv_img/lv_gif path (needs PSRAM); "" → clears to dial.
+        // pause LVGL. .rgb565 → stream straight to the LCD (no PSRAM); "ram:" →
+        // stream from the SRAM cover frame (no flash at all); anything else →
+        // the LVGL lv_img/lv_gif path (needs PSRAM); "" → clears to dial.
         const String& active = DeviceSettings::getInstance().activeSprite;
-        if (active != last_sprite) {
+        bool is_ram = active.startsWith("ram:");
+        bool ram_updated = is_ram && (SpriteStore::ramGen() != last_ram_gen);
+        if (active != last_sprite || ram_updated) {
             last_sprite = active;
-            if (active.endsWith(".rgb565") && SpriteStore::exists(active)) {
+            if (is_ram) last_ram_gen = SpriteStore::ramGen();
+            if (active.endsWith(".rgb565") &&
+                (is_ram ? SpriteStore::ramValid() : SpriteStore::exists(active))) {
                 lcd_stream_rgb565(active);                  // sets s_raw_image = true
                 music_reset();                              // fresh overlay state for the new cover
             } else {

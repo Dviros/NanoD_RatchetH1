@@ -90,5 +90,12 @@ namespace SpriteStore {
     bool   binFeed(const uint8_t* buf, size_t len);
     void   binAbort();   // abort a stalled/interrupted binary upload (com-thread timeout)
     void   binWatchdog(); // auto-abort an abandoned upload after a 2 s stall (self-heal)
+    bool   binActive();  // any binary upload in flight (chunk-drain gate; ram OR flash)
+
+    // RAM cover frame ("rambegin" path — no flash write, motor stays live).
+    bool           ramValid();
+    const uint8_t* ramFrame();
+    size_t         ramLen();
+    uint32_t       ramGen();   // bumps on every completed frame (LCD re-stream trigger)
 
 } // namespace SpriteStore

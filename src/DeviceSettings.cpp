@@ -489,7 +489,15 @@ bool DeviceSettings::_loadFromJson(const String& raw) {
     if (!obj["deviceName"].isNull()) deviceName       = obj["deviceName"].as<String>();
     if (obj["idleTimeout"].is<uint32_t>())  idleTimeout      = obj["idleTimeout"].as<uint32_t>();
     if (obj["sysexId"].is<uint8_t>())       midi_sysex_id    = obj["sysexId"].as<uint8_t>();
-    if (!obj["activeSprite"].isNull()) activeSprite     = obj["activeSprite"].as<String>();
+    if (!obj["activeSprite"].isNull()) {
+        String s = obj["activeSprite"].as<String>();
+        // Music covers are session-transient: the RAM frame doesn't survive a power
+        // cycle and the bridge re-pushes the current track's art after every boot.
+        // Restoring one from settings shows a STALE cover for a track that isn't
+        // playing. Only user sprites (gif/png/bmp) are restored at boot.
+        if (!s.endsWith(".rgb565") && !s.startsWith("ram:"))
+            activeSprite = s;
+    }
 
     // PD voltage from file (clamp)
     if (obj["pdVoltage"].is<float>()) {
